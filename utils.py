@@ -431,7 +431,7 @@ def get_point_at_distance(points, cumulative_distances, target_distance):
     # 如果没找到，返回最后一个点
     return points[-1] if points else None
 
-def node_bounds(node, ui_scale):
+def node_bounds(node):
     """
     计算节点边界框的 View2D 坐标（优化版本，用于减少锯齿）
     """
