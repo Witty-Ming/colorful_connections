@@ -8,41 +8,51 @@ import colorsys
 from ctypes import c_void_p, c_float
 from math import pi, sqrt, exp, hypot, sin, cos
 
-def node_bounds(node, ui_scale):
-    """
-    计算节点边界框的 View2D 坐标
-    """
-    ax, ay = node.location.x, node.location.y
-    p = node.parent
-    while p:
-        ax += p.location.x
-        ay += p.location.y
-        p = p.parent
 
-    if node.hide:
-        dpi_fac = bpy.context.preferences.system.dpi / 72
-        magic_w_cloud_value = 9
-        x_min = ax
-        x_max = ax + node.width
-        height = node.dimensions.y / dpi_fac
-        y_min = ay - (height / 2 + magic_w_cloud_value)
-        y_max = ay + (height / 2 - magic_w_cloud_value)
-        x_min *= dpi_fac
-        x_max *= dpi_fac
-        y_min *= dpi_fac
-        y_max *= dpi_fac
+# 关键算法源于 node-align V3.2
+# https://extensions.blender.org/add-ons/node-align
+# Developer: W_Cloud
+# https://space.bilibili.com/1109241880
+# 来一点咖啡吗、sunkaiwei 完善
+def node_bounds(node):
+    scale = bpy.context.preferences.system.ui_scale
+    di_x = node.dimensions.x
+    di_y = node.dimensions.y
+
+    w_cloud_magic_value = 9
+    rara_magic_value = 5
+    if hasattr(node, "location_absolute"):
+        node_x = node.location_absolute.x
+        node_y = node.location_absolute.y
+    else: #低版本没有location_absolute，使用兼容算法#131335
+        node_x = node.location.x
+        node_y = node.location.y
+        node_p = node.parent
+        while node_p:
+            node_x += node_p.location.x
+            node_y += node_p.location.y
+            node_p = node_p.parent
+
+    #当节点类型为中转点时，使用特殊输出
+    if node.type=="REROUTE":
+        x_min = (node_x - rara_magic_value) * scale
+        x_max = (node_x + rara_magic_value) * scale
+        y_min = (node_y - rara_magic_value) * scale
+        y_max = (node_y + rara_magic_value) * scale
+        return x_min, x_max, y_min, y_max
+    x_min = node_x * scale
+    x_max = x_min + di_x
+    if node.hide and node.type not in {"REROUTE","FRAME"}:
+        y_min = node_y * scale - w_cloud_magic_value * scale - di_y / 2
+        y_max = node_y * scale - w_cloud_magic_value * scale + di_y / 2
     else:
-        x_min = ax * ui_scale
-        x_max = x_min + node.dimensions.x
-        y_max = ay * ui_scale
-        y_min = y_max - node.dimensions.y
-
+        y_min = node_y * scale
+        y_max = y_min - di_y
     return x_min, x_max, y_min, y_max
-
 
 def get_rounded_rect_path(node, v2d, radius=4.0, resolution=12, thickness=0.0):
     ui_scale = bpy.context.preferences.system.ui_scale
-    x_min, x_max, y_min, y_max = node_bounds(node, ui_scale)
+    x_min, x_max, y_min, y_max = node_bounds(node)
     
     # 转换到 Region 像素坐标
     p_bl = v2d.view_to_region(x_min, y_min, clip=False)
