@@ -9,7 +9,7 @@ type = "add-on"
 
 website = "https://www.blender.org"
 
-tags = ["Node", "UI"]
+tags = ["Node"]
 
 blender_version_min = "4.2.0"
 
@@ -25,4 +25,5 @@ paths_exclude_pattern = [
   ".*",
   "*.zip",
   "*.log",
+  "colorful_node_wrangler/",
 ]
