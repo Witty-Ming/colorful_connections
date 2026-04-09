@@ -135,6 +135,7 @@ def _save_global_settings_internal(settings):
             'lock_flow': settings.lock_flow,
             
             # 颜色设置
+            'enable_type_based_colors': settings.enable_type_based_colors,
             'connection_color_type': settings.connection_color_type,
             'gradient_color_count': settings.gradient_color_count,
             'gradient_colors': [],
@@ -217,6 +218,8 @@ def load_global_settings(settings):
             settings.lock_flow = settings_data['lock_flow']
         
         # 加载颜色设置
+        if 'enable_type_based_colors' in settings_data:
+            settings.enable_type_based_colors = settings_data['enable_type_based_colors']
         if 'connection_color_type' in settings_data:
             # 兼容旧数据：如果是RAINBOW，改为CUSTOM
             color_type = settings_data['connection_color_type']
@@ -370,12 +373,41 @@ class UI_UL_gradient_preset_list(bpy.types.UIList):
             layout.alignment = 'CENTER'
             layout.label(text="", icon='PRESET')
 
-# 辅助函数：颜色更新回调（不再自动保存）
-def _gradient_color_update(self, context):
-    """颜色更新时的回调（不自动保存）"""
-    pass
+# 辅助函数：自动保存当前设置
 
-# 强制更新重绘的函数
+def _get_settings_from_context(context=None):
+    try:
+        ctx = context or bpy.context
+        scene = getattr(ctx, 'scene', None)
+        if scene and hasattr(scene, 'colorful_connections_settings'):
+            return scene.colorful_connections_settings
+    except Exception:
+        pass
+    return None
+
+
+def _autosave_settings(context=None):
+    global _loading_settings
+    if _loading_settings:
+        return
+
+    settings = _get_settings_from_context(context)
+    if settings is not None:
+        _save_global_settings_internal(settings)
+
+
+# 辅助函数：颜色更新回调
+
+def _gradient_color_update(self, context):
+    """颜色更新时的回调"""
+    _force_redraw_update()
+    _autosave_settings(context)
+
+
+def _save_and_redraw_update(self, context):
+    _force_redraw_update()
+    _autosave_settings(context)
+
 def _force_redraw_update():
     """当底层背景颜色改变时，强制触发重绘"""
     try:
@@ -393,14 +425,16 @@ class GradientColorItem(bpy.types.PropertyGroup):
         subtype='COLOR',
         default=(1.0, 1.0, 1.0),
         min=0.0, max=1.0,
-        size=3  # RGB only
+        size=3,  # RGB only
+        update=_gradient_color_update
     )
     alpha: bpy.props.FloatProperty(
         name="透明度",
         description="该颜色的透明度（0.0=完全透明，1.0=完全不透明）",
         default=1.0,
         min=0.0,
-        max=1.0
+        max=1.0,
+        update=_gradient_color_update
     )
 
 class GradientPreset(bpy.types.PropertyGroup):
@@ -420,7 +454,8 @@ class ColorfulConnectionsSettings(bpy.types.PropertyGroup):
             ('ALL_SELECTED', '所有选中', '显示所有被选中节点的连线'),
             ('ACTIVE_FLOW', '活动节点流', '仅显示当前活动节点的数据流向'),
         ],
-        default='ACTIVE_FLOW'
+        default='ACTIVE_FLOW',
+        update=_save_and_redraw_update
     )
     
     flow_direction: bpy.props.EnumProperty(
@@ -431,19 +466,22 @@ class ColorfulConnectionsSettings(bpy.types.PropertyGroup):
             ('UPSTREAM', '向上追溯 (输入)', '仅显示数据的来源'),
             ('DOWNSTREAM', '向下传递 (输出)', '仅显示数据被哪里使用了'),
         ],
-        default='BOTH'
+        default='BOTH',
+        update=_save_and_redraw_update
     )
     
     lock_flow: bpy.props.BoolProperty(
         name="固定当前流",
         description="勾选后固定当前显示的流，不会随活动节点变化而刷新。取消勾选后恢复自动刷新",
-        default=False
+        default=False,
+        update=_save_and_redraw_update
     )
     
     enable_type_based_colors: bpy.props.BoolProperty(
         name="根据数据类型着色",
         description="启用后，不同数据类型的连线会使用不同的色相偏移，便于区分数据类型",
-        default=False
+        default=False,
+        update=_save_and_redraw_update
     )
     
     # 移除彩虹色选项，只保留自定义（但保留属性以兼容旧数据）
@@ -453,7 +491,8 @@ class ColorfulConnectionsSettings(bpy.types.PropertyGroup):
         items=[
             ('CUSTOM', '自定义', '使用自定义渐变色显示连线'),
         ],
-        default='CUSTOM'
+        default='CUSTOM',
+        update=_save_and_redraw_update
     )
     
     # --- 动态颜色系统：Constant（常量）类型 ---
@@ -479,8 +518,10 @@ class ColorfulConnectionsSettings(bpy.types.PropertyGroup):
     )
     
     def _update_color_count_and_save(self, context):
-        """更新常量颜色数量（不自动保存）"""
+        """更新常量颜色数量并保存"""
         self._update_color_count()
+        _force_redraw_update()
+        _autosave_settings(context)
     
     def _update_color_count(self):
         """更新常量颜色数量时，确保集合中有足够的颜色项"""
@@ -516,8 +557,10 @@ class ColorfulConnectionsSettings(bpy.types.PropertyGroup):
             pass
     
     def _update_field_color_count_and_save(self, context):
-        """更新域颜色数量（不自动保存）"""
+        """更新域颜色数量并保存"""
         self._update_field_color_count()
+        _force_redraw_update()
+        _autosave_settings(context)
     
     def _update_field_color_count(self):
         """更新域颜色数量时，确保集合中有足够的颜色项"""
@@ -561,7 +604,8 @@ class ColorfulConnectionsSettings(bpy.types.PropertyGroup):
         description="设置颜色流动动画的速度",
         default=2.0,
         min=0.1,
-        max=10.0
+        max=10.0,
+        update=_save_and_redraw_update
     )
     
     line_thickness: bpy.props.FloatProperty(
@@ -569,7 +613,8 @@ class ColorfulConnectionsSettings(bpy.types.PropertyGroup):
         description="设置连线的粗细程度",
         default=5.0,
         min=1.0,
-        max=20.0
+        max=20.0,
+        update=_save_and_redraw_update
     )
 
     node_border_thickness: bpy.props.FloatProperty(
@@ -577,13 +622,15 @@ class ColorfulConnectionsSettings(bpy.types.PropertyGroup):
         description="设置节点彩色边框的粗细程度",
         default=3.0,
         min=1.0,
-        max=20.0
+        max=20.0,
+        update=_save_and_redraw_update
     )
     
     enable_colorful_connections: bpy.props.BoolProperty(
         name="启用彩色连线",
         description="启用或禁用彩色连线功能",
-        default=True
+        default=True,
+        update=_save_and_redraw_update
     )
     
     overall_opacity: bpy.props.FloatProperty(
@@ -591,7 +638,8 @@ class ColorfulConnectionsSettings(bpy.types.PropertyGroup):
         description="调整所有绘制元素的透明度（0.0=完全透明，1.0=完全不透明）",
         default=1.0,
         min=0.0,
-        max=1.0
+        max=1.0,
+        update=_save_and_redraw_update
     )
     
     backing_color_rgb: bpy.props.FloatVectorProperty(
@@ -601,7 +649,7 @@ class ColorfulConnectionsSettings(bpy.types.PropertyGroup):
         default=(0.0, 0.0, 0.0),
         min=0.0, max=1.0,
         size=3,  # RGB only
-        update=lambda self, context: _force_redraw_update()
+        update=_save_and_redraw_update
     )
     
     backing_color_alpha: bpy.props.FloatProperty(
@@ -611,7 +659,7 @@ class ColorfulConnectionsSettings(bpy.types.PropertyGroup):
         min=0.0,
         max=1.0,
         subtype='FACTOR',
-        update=lambda self, context: _force_redraw_update()
+        update=_save_and_redraw_update
     )
 
 # 操作符：保存预设
@@ -641,7 +689,8 @@ class NODE_OT_save_gradient_preset(bpy.types.Operator):
         
         # 保存到文件
         save_presets_to_file(settings)
-        
+        _autosave_settings(context)
+
         return {'FINISHED'}
 
 # 操作符：应用预设
@@ -676,8 +725,9 @@ class NODE_OT_apply_gradient_preset(bpy.types.Operator):
         settings.active_preset_index = idx
         settings.last_applied_preset_index = idx  # 记录最后应用的预设
         
-        # 不自动保存全局设置，由用户手动保存
-        
+        # 自动保存当前应用结果
+        _autosave_settings(context)
+
         return {'FINISHED'}
 
 # 操作符：手动保存设置
@@ -718,6 +768,7 @@ class NODE_OT_delete_gradient_preset(bpy.types.Operator):
         # 只保存预设到文件（预设操作应该保存，但全局设置不自动保存）
         try:
             save_presets_to_file(settings)
+            _autosave_settings(context)
         except Exception as e:
             print(f"删除预设时出错: {e}")
             import traceback
@@ -750,11 +801,10 @@ class NODE_PT_colorful_connections_panel(bpy.types.Panel):
         # --- 预设管理区域（移到顶层） ---
         box_preset = col.box()
         box_preset.label(text="预设方案:", icon='PRESET')
-        
+        preset_col = box_preset.column(align=True)
+
         if len(settings.gradient_presets) > 0:
-            # 预设列表和操作按钮
-            split = box_preset.split(factor=0.7)
-            split.template_list(
+            preset_col.template_list(
                 "UI_UL_gradient_preset_list",
                 "",
                 settings,
@@ -763,18 +813,18 @@ class NODE_PT_colorful_connections_panel(bpy.types.Panel):
                 "active_preset_index",
                 rows=2
             )
-            
-            col_presets = split.column(align=True)
-            col_presets.operator("node.apply_gradient_preset", text="应用", icon='PLAY')
-            col_presets.operator("node.save_gradient_preset", text="保存", icon='FILE_TICK')
-            col_presets.operator("node.delete_gradient_preset", text="删除", icon='TRASH')
-            
+
+            button_col = preset_col.column(align=True)
+            button_col.operator("node.apply_gradient_preset", text="应用", icon='PLAY')
+            button_col.operator("node.save_gradient_preset", text="保存", icon='FILE_TICK')
+            button_col.operator("node.delete_gradient_preset", text="删除", icon='TRASH')
+
             # 如果有预设，默认应用第一个（如果是首次加载）
             if settings.active_preset_index >= 0 and settings.active_preset_index < len(settings.gradient_presets):
                 # 自动应用当前选中的预设（如果需要）
                 pass
         else:
-            box_preset.operator("node.save_gradient_preset", text="保存当前为预设", icon='FILE_TICK')
+            preset_col.operator("node.save_gradient_preset", text="保存当前为预设", icon='FILE_TICK')
         
         col.separator()
         
@@ -823,23 +873,21 @@ class NODE_PT_colorful_connections_panel(bpy.types.Panel):
         box_constant.label(text="颜色列表 (循环渐变):")
         active_count = settings.gradient_color_count
         colors = settings.gradient_colors
-        
+
         # 注意：不在 draw 方法中修改场景数据，如果颜色不足，只显示已有的颜色
         # 初始化会在注册时或场景加载后完成
-        
-        # 显示颜色列表，每个颜色包含颜色选择器和透明度滑块（同一行）
+
+        # 显示颜色列表，每个颜色包含颜色选择器和透明度滑块
         # 只显示已存在的颜色项，最多显示 active_count 个
         display_count = min(active_count, len(colors))
         for idx in range(display_count):
             # 确保alpha属性存在（兼容旧数据）
             if not hasattr(colors[idx], 'alpha'):
                 colors[idx].alpha = 1.0
-            
-            # 颜色和透明度在同一行，颜色占前2/3，透明度占后1/3
-            row = box_constant.row()
-            split = row.split(factor=0.67)  # 前67%用于颜色
-            split.prop(colors[idx], "color", text=f"颜色 {idx+1}")
-            row.prop(colors[idx], "alpha", text="透明度", slider=True)
+
+            item_col = box_constant.column(align=True)
+            item_col.prop(colors[idx], "color", text=f"颜色 {idx+1}")
+            item_col.prop(colors[idx], "alpha", text="透明度", slider=True)
         
         # 如果颜色不足，显示提示（但不在这里修改场景数据）
         if len(colors) < active_count:
@@ -862,23 +910,21 @@ class NODE_PT_colorful_connections_panel(bpy.types.Panel):
         box_field.label(text="颜色列表 (循环渐变):")
         field_active_count = settings.field_gradient_color_count
         field_colors = settings.field_gradient_colors
-        
+
         # 注意：不在 draw 方法中修改场景数据，如果颜色不足，只显示已有的颜色
         # 初始化会在注册时或场景加载后完成
-        
-        # 显示颜色列表，每个颜色包含颜色选择器和透明度滑块（同一行）
+
+        # 显示颜色列表，每个颜色包含颜色选择器和透明度滑块
         # 只显示已存在的颜色项，最多显示 field_active_count 个
         field_display_count = min(field_active_count, len(field_colors))
         for idx in range(field_display_count):
             # 确保alpha属性存在（兼容旧数据）
             if not hasattr(field_colors[idx], 'alpha'):
                 field_colors[idx].alpha = 1.0
-            
-            # 颜色和透明度在同一行，颜色占前2/3，透明度占后1/3
-            row = box_field.row()
-            split = row.split(factor=0.67)  # 前67%用于颜色
-            split.prop(field_colors[idx], "color", text=f"颜色 {idx+1}")
-            row.prop(field_colors[idx], "alpha", text="透明度", slider=True)
+
+            item_col = box_field.column(align=True)
+            item_col.prop(field_colors[idx], "color", text=f"颜色 {idx+1}")
+            item_col.prop(field_colors[idx], "alpha", text="透明度", slider=True)
         
         # 如果颜色不足，显示提示（但不在这里修改场景数据）
         if len(field_colors) < field_active_count:
@@ -893,10 +939,9 @@ class NODE_PT_colorful_connections_panel(bpy.types.Panel):
         
         col.separator()
         col.label(text="底层背景:")
-        row_backing = col.row()
-        split = row_backing.split(factor=0.67)  # 前67%用于颜色
-        split.prop(settings, "backing_color_rgb", text="颜色")
-        row_backing.prop(settings, "backing_color_alpha", text="透明度", slider=True)
+        backing_col = col.column(align=True)
+        backing_col.prop(settings, "backing_color_rgb", text="颜色")
+        backing_col.prop(settings, "backing_color_alpha", text="透明度", slider=True)
         
         col.separator()
         

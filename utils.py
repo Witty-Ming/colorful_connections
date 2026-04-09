@@ -11,24 +11,47 @@ import re
 
 # Socket类型到色相偏移的映射（基于HSV色相，范围0-360度）
 SOCKET_TYPE_HUE_OFFSETS = {
-    'NodeSocketFloat': 0.0,        # 灰色，无偏移
-    'NodeSocketInt': 15.0,         # 绿色偏黄
-    'NodeSocketVector': -60.0,     # 蓝色
-    'NodeSocketColor': 30.0,       # 黄色
-    'NodeSocketShader': 120.0,     # 绿色
-    'NodeSocketBool': 300.0,       # 紫色
-    'NodeSocketString': 200.0,     # 青色
-    'NodeSocketObject': 20.0,      # 橙黄色
-    'NodeSocketImage': 270.0,      # 粉紫色
-    'NodeSocketGeometry': 150.0,   # 青绿色
-    'NodeSocketCollection': 0.0,   # 白色，无偏移
-    'NodeSocketTexture': 60.0,     # 黄色偏橙
-    'NodeSocketMaterial': 350.0,   # 红紫色
-    'NodeSocketRotation': 240.0,   # 蓝紫色
-    'NodeSocketMenu': 0.0,         # 灰色，无偏移
-    'NodeSocketMatrix': 330.0,     # 红紫色
-    'NodeSocketClosure': 90.0,     # 黄绿色
+    'NodeSocketFloat': 0.0,
+    'NodeSocketInt': 18.0,
+    'NodeSocketVector': 35.0,
+    'NodeSocketColor': -25.0,
+    'NodeSocketShader': 140.0,
+    'NodeSocketBool': -55.0,
+    'NodeSocketString': 70.0,
+    'NodeSocketObject': 105.0,
+    'NodeSocketImage': -40.0,
+    'NodeSocketGeometry': 170.0,
+    'NodeSocketCollection': 120.0,
+    'NodeSocketTexture': -70.0,
+    'NodeSocketMaterial': 150.0,
+    'NodeSocketRotation': 55.0,
+    'NodeSocketMenu': 85.0,
+    'NodeSocketMatrix': 95.0,
 }
+
+NODE_LAYOUT_DEFAULTS = {
+    'hidden_header_offset': 9.0,
+    'reroute_half_size': 5.5,
+    'socket_header_height': 32.0,
+    'socket_row_height': 21.0,
+    'socket_output_nudge': 0.5,
+}
+
+
+def get_layout_metrics():
+    prefs = bpy.context.preferences.system
+    scale = max(0.01, float(prefs.ui_scale))
+    pixel_size = max(1.0, float(prefs.pixel_size))
+    return {
+        'scale': scale,
+        'pixel_size': pixel_size,
+        'hidden_header_offset': NODE_LAYOUT_DEFAULTS['hidden_header_offset'] * scale,
+        'reroute_half_size': NODE_LAYOUT_DEFAULTS['reroute_half_size'] * scale,
+        'socket_header_height': NODE_LAYOUT_DEFAULTS['socket_header_height'] * scale,
+        'socket_row_height': NODE_LAYOUT_DEFAULTS['socket_row_height'] * scale,
+        'socket_output_nudge': NODE_LAYOUT_DEFAULTS['socket_output_nudge'] * scale,
+    }
+
 
 def get_socket_type_name(socket):
     """获取socket的类型名称"""
@@ -431,80 +454,403 @@ def get_point_at_distance(points, cumulative_distances, target_distance):
     # 如果没找到，返回最后一个点
     return points[-1] if points else None
 
-def node_bounds(node):
+def filter_border_path_near_sockets(path, socket_masks):
+    if not path or len(path) < 2:
+        return []
+    return split_polyline_by_socket_masks(path, socket_masks)
+
+
+def point_in_socket_mask(point, socket_mask):
+    if not point or not socket_mask:
+        return False
+
+    cx, cy, radius, shape_id = socket_mask
+    if radius <= 0.0:
+        return False
+
+    dx = (point[0] - cx) / radius
+    dy = (point[1] - cy) / radius
+
+    if shape_id < 0.5:
+        return dx * dx + dy * dy <= 1.0
+    if shape_id < 1.5:
+        return abs(dx) <= 1.0 and abs(dy) <= 1.0
+    return abs(dx) + abs(dy) <= 1.0
+
+
+def _lerp_point(p0, p1, t):
+    return (
+        p0[0] + (p1[0] - p0[0]) * t,
+        p0[1] + (p1[1] - p0[1]) * t,
+    )
+
+
+def _points_almost_equal(p0, p1, epsilon=0.01):
+    return abs(p0[0] - p1[0]) <= epsilon and abs(p0[1] - p1[1]) <= epsilon
+
+
+def _offset_point_along_segment(p0, p1, point, distance):
+    if distance <= 1e-6:
+        return point
+
+    segment = Vector((p1[0] - p0[0], p1[1] - p0[1]))
+    seg_len = segment.length
+    if seg_len <= 1e-6:
+        return point
+
+    direction = segment / seg_len
+    point_vec = Vector(point)
+    start_vec = Vector(p0)
+    end_vec = Vector(p1)
+    start_dist = (point_vec - start_vec).length
+    end_dist = (end_vec - point_vec).length
+
+    if start_dist <= end_dist:
+        adjusted = point_vec - direction * min(distance, start_dist)
+    else:
+        adjusted = point_vec + direction * min(distance, end_dist)
+
+    return (adjusted.x, adjusted.y)
+
+
+def _append_unique_t(ts, t, epsilon=1e-6):
+    if t < -epsilon or t > 1.0 + epsilon:
+        return
+
+    t = max(0.0, min(1.0, t))
+    for existing in ts:
+        if abs(existing - t) <= epsilon:
+            return
+    ts.append(t)
+
+
+def _get_segment_mask_intersections(p0, p1, socket_mask):
+    cx, cy, radius, shape_id = socket_mask
+    if radius <= 0.0:
+        return []
+
+    ax = (p0[0] - cx) / radius
+    ay = (p0[1] - cy) / radius
+    bx = (p1[0] - cx) / radius
+    by = (p1[1] - cy) / radius
+    dx = bx - ax
+    dy = by - ay
+
+    intersections = []
+    tolerance = 1e-5
+
+    if shape_id < 0.5:
+        a = dx * dx + dy * dy
+        b = 2.0 * (ax * dx + ay * dy)
+        c = ax * ax + ay * ay - 1.0
+        if a <= tolerance:
+            return []
+
+        discriminant = b * b - 4.0 * a * c
+        if discriminant < -tolerance:
+            return []
+        discriminant = max(discriminant, 0.0)
+        root = sqrt(discriminant)
+        _append_unique_t(intersections, (-b - root) / (2.0 * a))
+        _append_unique_t(intersections, (-b + root) / (2.0 * a))
+        return sorted(intersections)
+
+    if shape_id < 1.5:
+        if abs(dx) > tolerance:
+            for boundary_x in (-1.0, 1.0):
+                t = (boundary_x - ax) / dx
+                if 0.0 - tolerance <= t <= 1.0 + tolerance:
+                    y = ay + dy * t
+                    if abs(y) <= 1.0 + tolerance:
+                        _append_unique_t(intersections, t)
+        if abs(dy) > tolerance:
+            for boundary_y in (-1.0, 1.0):
+                t = (boundary_y - ay) / dy
+                if 0.0 - tolerance <= t <= 1.0 + tolerance:
+                    x = ax + dx * t
+                    if abs(x) <= 1.0 + tolerance:
+                        _append_unique_t(intersections, t)
+        return sorted(intersections)
+
+    plane_constants = (1.0, 1.0, 1.0, 1.0)
+    plane_factors = (
+        (1.0, 1.0),
+        (1.0, -1.0),
+        (-1.0, 1.0),
+        (-1.0, -1.0),
+    )
+    for (fx, fy), plane_constant in zip(plane_factors, plane_constants):
+        denominator = fx * dx + fy * dy
+        if abs(denominator) <= tolerance:
+            continue
+        numerator = plane_constant - (fx * ax + fy * ay)
+        t = numerator / denominator
+        if 0.0 - tolerance <= t <= 1.0 + tolerance:
+            x = ax + dx * t
+            y = ay + dy * t
+            if abs(x) + abs(y) <= 1.0 + tolerance:
+                _append_unique_t(intersections, t)
+    return sorted(intersections)
+
+
+def _get_segment_mask_interval(p0, p1, socket_mask):
+    intersections = [0.0, 1.0]
+    for t in _get_segment_mask_intersections(p0, p1, socket_mask):
+        _append_unique_t(intersections, t)
+    intersections.sort()
+
+    inside_ranges = []
+    for i in range(len(intersections) - 1):
+        t0 = intersections[i]
+        t1 = intersections[i + 1]
+        if t1 - t0 <= 1e-6:
+            continue
+        mid = _lerp_point(p0, p1, (t0 + t1) * 0.5)
+        if point_in_socket_mask(mid, socket_mask):
+            inside_ranges.append((t0, t1))
+
+    if not inside_ranges:
+        return None
+
+    return inside_ranges[0][0], inside_ranges[-1][1]
+
+
+def _clip_segment_outside_socket_mask(p0, p1, socket_mask):
+    interval = _get_segment_mask_interval(p0, p1, socket_mask)
+    if interval is None:
+        return [(p0, p1)]
+
+    start_t, end_t = interval
+    if end_t - start_t <= 1e-5:
+        return [(p0, p1)]
+
+    segment = Vector((p1[0] - p0[0], p1[1] - p0[1]))
+    seg_len = segment.length
+    if seg_len <= 1e-6:
+        return []
+
+    _, _, radius, _ = socket_mask
+    cap_overlap = max(0.35, min(radius * 0.18, 1.35))
+    overlap_t = min((end_t - start_t) * 0.5, cap_overlap / seg_len)
+
+    clipped_segments = []
+    if start_t > 1e-5:
+        end_point = _lerp_point(p0, p1, min(start_t + overlap_t, end_t))
+        if not _points_almost_equal(p0, end_point):
+            clipped_segments.append((p0, end_point))
+    if end_t < 1.0 - 1e-5:
+        start_point = _lerp_point(p0, p1, max(end_t - overlap_t, start_t))
+        if not _points_almost_equal(start_point, p1):
+            clipped_segments.append((start_point, p1))
+    return clipped_segments
+
+
+def _split_polyline_by_single_socket_mask(points, socket_mask):
+    result = []
+    current_segment = []
+
+    for i in range(len(points) - 1):
+        p0 = points[i]
+        p1 = points[i + 1]
+        clipped_parts = _clip_segment_outside_socket_mask(p0, p1, socket_mask)
+
+        if not clipped_parts:
+            if len(current_segment) >= 2:
+                result.append(current_segment)
+            current_segment = []
+            continue
+
+        for part_index, (start_point, end_point) in enumerate(clipped_parts):
+            if _points_almost_equal(start_point, end_point):
+                continue
+
+            if not current_segment:
+                current_segment = [start_point, end_point]
+            elif _points_almost_equal(current_segment[-1], start_point):
+                if not _points_almost_equal(current_segment[-1], end_point):
+                    current_segment.append(end_point)
+            else:
+                if len(current_segment) >= 2:
+                    result.append(current_segment)
+                current_segment = [start_point, end_point]
+
+            if part_index != len(clipped_parts) - 1:
+                if len(current_segment) >= 2:
+                    result.append(current_segment)
+                current_segment = []
+
+    if len(current_segment) >= 2:
+        result.append(current_segment)
+
+    return result
+
+
+def split_polyline_by_socket_masks(points, socket_masks):
+    if not points or len(points) < 2:
+        return []
+    if not socket_masks:
+        return [points]
+
+    segments = [points]
+    for socket_mask in socket_masks:
+        next_segments = []
+        for segment in segments:
+            next_segments.extend(_split_polyline_by_single_socket_mask(segment, socket_mask))
+        segments = next_segments
+        if not segments:
+            break
+
+    return [segment for segment in segments if len(segment) >= 2]
+
+
+SOCKET_MASK_SHAPES = {
+    'CIRCLE': 0.0,
+    'SQUARE': 1.0,
+    'DIAMOND': 2.0,
+}
+
+
+def get_socket_shape_name(socket):
+    shape = getattr(socket, 'display_shape', 'CIRCLE') or 'CIRCLE'
+    if shape.endswith('_DOT'):
+        shape = shape[:-4]
+    if shape not in SOCKET_MASK_SHAPES:
+        shape = 'CIRCLE'
+    return shape
+
+
+def get_socket_mask_radius(socket, zoom, clip_width=0.0, extra_padding=0.0):
+    shape = get_socket_shape_name(socket)
+    base_radius = 4.2 * zoom
+    if shape == 'SQUARE':
+        base_radius = 4.45 * zoom
+    elif shape == 'DIAMOND':
+        base_radius = 4.7 * zoom
+
+    line_padding = max(0.0, clip_width) * 0.08
+    return max(base_radius + line_padding + extra_padding, 3.8 * zoom + 0.35)
+
+
+def _append_socket_mask(masks, seen_sockets, socket, center, zoom, clip_width=0.0, extra_padding=0.0):
+    if not socket or not center:
+        return
+
+    try:
+        socket_ptr = socket.as_pointer()
+    except Exception:
+        socket_ptr = id(socket)
+
+    if socket_ptr in seen_sockets:
+        return
+
+    shape_name = get_socket_shape_name(socket)
+    radius = get_socket_mask_radius(socket, zoom, clip_width=clip_width, extra_padding=extra_padding)
+    masks.append((float(center[0]), float(center[1]), float(radius), SOCKET_MASK_SHAPES[shape_name]))
+    seen_sockets.add(socket_ptr)
+
+
+def collect_node_socket_masks(node, v2d, zoom, border_width=0.0):
+    masks = []
+    seen_sockets = set()
+
+    for is_output, sockets in ((False, getattr(node, 'inputs', [])), (True, getattr(node, 'outputs', []))):
+        for idx, socket in enumerate(sockets):
+            if not getattr(socket, 'enabled', True):
+                continue
+            try:
+                sx, sy = get_socket_loc(node, is_output, idx)
+                center = v2d.view_to_region(sx, sy, clip=False)
+            except Exception:
+                continue
+
+            _append_socket_mask(masks, seen_sockets, socket, center, zoom, clip_width=border_width)
+
+    return masks
+
+
+def _node_location_absolute(node):
+    if hasattr(node, "location_absolute"):
+        return Vector((node.location_absolute.x, node.location_absolute.y))
+
+    location = Vector((node.location.x, node.location.y))
+    node_p = node.parent
+    while node_p:
+        location += Vector((node_p.location.x, node_p.location.y))
+        node_p = node_p.parent
+    return location
+
+
+def node_bounds(node, ui_scale=None):
     """
     计算节点边界框的 View2D 坐标（优化版本，用于减少锯齿）
     """
-    scale = bpy.context.preferences.system.ui_scale
-    
+    metrics = get_layout_metrics()
+    scale = metrics['scale'] if ui_scale is None else ui_scale
+
     di_x = node.dimensions.x
     di_y = node.dimensions.y
-    w_cloud_magic_value = 9
-    rara_magic_value = 5
-    
-    if hasattr(node, "location_absolute"):
-        node_x = node.location_absolute.x
-        node_y = node.location_absolute.y
-    else:
-        # 低版本没有location_absolute，使用兼容算法
-        node_x = node.location.x
-        node_y = node.location.y
-        node_p = node.parent
-        while node_p:
-            node_x += node_p.location.x
-            node_y += node_p.location.y
-            node_p = node_p.parent
-    
-    # 当节点类型为中转点时，使用特殊输出
+    node_location = _node_location_absolute(node)
+    node_x = node_location.x
+    node_y = node_location.y
+
     if node.type == "REROUTE":
-        x_min = (node_x - rara_magic_value) * scale
-        x_max = (node_x + rara_magic_value) * scale
-        y_min = (node_y - rara_magic_value) * scale
-        y_max = (node_y + rara_magic_value) * scale
-        return x_min, x_max, y_min, y_max
-    
+        reroute_half_size = metrics['reroute_half_size']
+        x_center = node_x * scale
+        y_center = node_y * scale
+        return (
+            x_center - reroute_half_size,
+            x_center + reroute_half_size,
+            y_center - reroute_half_size,
+            y_center + reroute_half_size,
+        )
+
+    width = di_x * scale
+    height = di_y * scale
     x_min = node_x * scale
-    x_max = x_min + di_x
-    
+    x_max = x_min + width
+
     if node.hide and node.type not in {"REROUTE", "FRAME"}:
-        y_min = node_y * scale - w_cloud_magic_value * scale - di_y / 2
-        y_max = node_y * scale - w_cloud_magic_value * scale + di_y / 2
+        hidden_offset = metrics['hidden_header_offset']
+        y_center = node_y * scale - hidden_offset
+        y_min = y_center - height / 2
+        y_max = y_center + height / 2
     else:
         y_min = node_y * scale
-        y_max = y_min - di_y
-    
+        y_max = y_min - height
+
     return x_min, x_max, y_min, y_max
 
-def get_rounded_rect_path(node, v2d, radius=4.0, resolution=12, thickness=0.0):
-    ui_scale = bpy.context.preferences.system.ui_scale
-    x_min, x_max, y_min, y_max = node_bounds(node)
-    
+
+def get_rounded_rect_path(node, v2d, radius=4.0, resolution=12, thickness=0.0, socket_masks=None):
+    metrics = get_layout_metrics()
+    x_min, x_max, y_min, y_max = node_bounds(node, metrics['scale'])
+
     # 转换到 Region 像素坐标
     p_bl = v2d.view_to_region(x_min, y_min, clip=False)
     p_tr = v2d.view_to_region(x_max, y_max, clip=False)
-    
+
     if not p_bl or not p_tr:
-        return None
-        
+        return []
+
     rmin_x = min(p_bl[0], p_tr[0])
     rmax_x = max(p_bl[0], p_tr[0])
     rmin_y = min(p_bl[1], p_tr[1])
     rmax_y = max(p_bl[1], p_tr[1])
-    
+
     # 向外扩张 (线宽的一半)
     offset = thickness * 0.5
     rmin_x -= offset
     rmax_x += offset
     rmin_y -= offset
     rmax_y += offset
-    
+
     w = rmax_x - rmin_x
     h = rmax_y - rmin_y
-    
+
     eff_radius = min(radius, w/2, h/2)
-    
+
     path = []
-    
+
     def add_arc(cx, cy, start_ang, end_ang):
         for i in range(resolution + 1):
             t = i / resolution
@@ -517,8 +863,8 @@ def get_rounded_rect_path(node, v2d, radius=4.0, resolution=12, thickness=0.0):
     add_arc(rmin_x + eff_radius, rmax_y - eff_radius, 0.5 * pi, 1.0 * pi)
     add_arc(rmin_x + eff_radius, rmin_y + eff_radius, 1.0 * pi, 1.5 * pi)
     path.append(((rmin_x + rmax_x)/2.0, rmin_y))
-    
-    return path
+
+    return filter_border_path_near_sockets(path, socket_masks)
 
     
 draw_handler = None
@@ -694,23 +1040,7 @@ def get_shader(name):
             }
         ''')
     
-    elif name == 'SDF_CIRCLE':
-        iface = gpu.types.GPUStageInterfaceInfo("node_wrangler_sdf_circle_iface")
-        iface.smooth('VEC2', 'v_uv')
-        info.vertex_in(0, 'VEC2', 'pos')
-        info.vertex_in(1, 'VEC2', 'uv')
-        info.vertex_out(iface)
-        info.push_constant('VEC4', 'color')
-        info.fragment_out(0, 'VEC4', 'fragColor')
-        info.vertex_source(vert_src)
-        info.fragment_source('''
-            void main() {
-                float dist = length(v_uv);
-                float delta = 1.5 * fwidth(dist);
-                float alpha = 1.0 - smoothstep(1.0 - delta, 1.0, dist);
-                fragColor = vec4(color.rgb, color.a * alpha);
-            }
-        ''')
+
 
     shader = gpu.shader.create_from_info(info)
     _SHADER_CACHE[name] = shader
@@ -852,60 +1182,59 @@ def _is_link_visible(region, pts, margin=50):
     
     return False
 
-def dpi_fac():
-    prefs = bpy.context.preferences.system
-    return prefs.dpi / 72
+def _is_socket_location_plausible(node, x, y, metrics):
+    if not (isfinite(x) and isfinite(y)):
+        return False
 
-def abs_node_location(node):
-    abs_location = node.location
-    if node.parent is None:
-        return abs_location
-    return abs_location + abs_node_location(node.parent)
+    if node.type == 'REROUTE':
+        return True
+
+    x_min, x_max, y_min, y_max = node_bounds(node, metrics['scale'])
+    x_margin = max(48.0 * metrics['scale'], metrics['socket_row_height'] * 1.5)
+    y_margin = max(96.0 * metrics['scale'], metrics['socket_row_height'] * 2.0)
+    return (
+        x_min - x_margin <= x <= x_max + x_margin and
+        y_max - y_margin <= y <= y_min + y_margin
+    )
+
 
 def get_socket_loc(node, is_output, index):
+    sockets = node.outputs if is_output else node.inputs
+    metrics = get_layout_metrics()
+
     try:
-        sockets = node.outputs if is_output else node.inputs
         if index < len(sockets):
             socket = sockets[index]
-            offset = 520 
-            if bpy.app.version >= (5, 1, 0): 
+            offset = 520
+            if bpy.app.version >= (5, 1, 0):
                 offset = 456
             vec = Vector((c_float * 2).from_address(c_void_p.from_address(socket.as_pointer() + offset).value + 24))
-            return vec.x, vec.y
+            if _is_socket_location_plausible(node, vec.x, vec.y, metrics):
+                return vec.x, vec.y
     except Exception:
         pass
 
+    node_location = _node_location_absolute(node)
+    base_x = node_location.x * metrics['scale']
+    base_y = node_location.y * metrics['scale']
+
     if node.type == 'REROUTE':
-        nlocx, nlocy = abs_node_location(node)
-        fac = dpi_fac()
-        return (nlocx + 1) * fac, (nlocy + 1) * fac
+        return base_x, base_y
 
-    fac = dpi_fac()
-    nlocx, nlocy = abs_node_location(node)
-    base_x = (nlocx + 1) * fac
-    base_y = (nlocy + 1) * fac
+    x = base_x + node.dimensions.x if is_output else base_x
 
-    if is_output:
-        x = base_x + node.dimensions.x
-    else:
-        x = base_x
-
-    header_height = 32.0 * fac
-    socket_height = 21.0 * fac
-    y = base_y - header_height
-
-    sockets = node.outputs if is_output else node.inputs
     enabled_sockets = [s for s in sockets if s.enabled]
     try:
         real_idx = enabled_sockets.index(sockets[index])
     except (ValueError, IndexError):
-        real_idx = 0
+        real_idx = max(0, min(index, len(enabled_sockets) - 1)) if enabled_sockets else 0
 
-    y = y - (real_idx * socket_height) - (socket_height * 0.5)
+    y = base_y - metrics['socket_header_height']
+    y -= (real_idx + 0.5) * metrics['socket_row_height']
     if is_output:
-        y += 0.5 * fac
+        y += metrics['socket_output_nudge']
     else:
-        y -= 0.5 * fac
+        y -= metrics['socket_output_nudge']
     return x, y
 
 def _get_socket_index_cached(cache, node, socket, is_output):
@@ -1030,48 +1359,6 @@ def draw_batch_lines(all_lines_data, shader_name, width, colors=None, time_sec=0
     batch = batch_for_shader(shader, 'TRI_STRIP', {"pos": all_pos, "uv": all_uv})
     batch.draw(shader)
 
-def draw_batch_circles(batch_circles, radius, color, overall_opacity=1.0):
-    if not batch_circles or radius <= 0:
-        return
-    shader = get_shader('SDF_CIRCLE')
-    if not shader:
-        return
-    adjusted_radius = radius * 1.0
-    size = adjusted_radius + 2.0
-    uv_scale = size / adjusted_radius if adjusted_radius > 0 else 1.0
-    all_pos = []
-    all_uv = []
-    o0 = (-size, -size)
-    o1 = ( size, -size)
-    o2 = (-size,  size)
-    o3 = ( size,  size)
-    u0 = (-uv_scale, -uv_scale)
-    u1 = ( uv_scale, -uv_scale)
-    u2 = (-uv_scale,  uv_scale)
-    u3 = ( uv_scale,  uv_scale)
-    
-    for (cx, cy) in batch_circles:
-        p0 = (cx + o0[0], cy + o0[1])
-        p1 = (cx + o1[0], cy + o1[1])
-        p2 = (cx + o2[0], cy + o2[1])
-        p3 = (cx + o3[0], cy + o3[1])
-        all_pos.extend([p0, p2, p1])
-        all_uv.extend([u0, u2, u1])
-        all_pos.extend([p1, p2, p3])
-        all_uv.extend([u1, u2, u3])
-    
-    # 应用透明度到颜色
-    if len(color) >= 4:
-        adjusted_color = (color[0], color[1], color[2], color[3] * overall_opacity)
-    else:
-        adjusted_color = (*color[:3], overall_opacity)
-        
-    batch = batch_for_shader(shader, 'TRIS', {"pos": all_pos, "uv": all_uv})
-    shader.bind()
-    shader.uniform_float("color", adjusted_color)
-    gpu.state.blend_set('ALPHA')
-    batch.draw(shader)
-    gpu.state.blend_set('NONE')
 
 def get_panel_settings():
     try:
@@ -1393,42 +1680,43 @@ def draw_colorful_connections():
 
     v2d = context.region.view2d
     zoom = _view2d_zoom_factor(v2d)
-    
+    border_pixel_size = get_layout_metrics()['pixel_size']
+
     time_sec = time.time() * settings.get('animation_speed', 1.0)
     connection_color_type = settings.get('connection_color_type', 'CUSTOM')
     overall_opacity = settings.get('overall_opacity', 1.0)
-    
+
     grad_cols = settings.get('gradient_colors', [])
     field_grad_cols = settings.get('field_gradient_colors', [])
-
-    batch_lines_backing = []
-    batch_lines_main = []
-    batch_node_bbox = []
-
-    batch_circles_backing = []
-    batch_circles_start = []
-    batch_circles_end = []
-
-    # 处理节点边框
-    if nodes_to_outline:
-        border_thickness = settings.get('node_border_thickness', 3.0)
-        bbox_width = max(1.0, border_thickness * zoom)
-        pixel_radius = 4.0 * zoom
-        
-        for node in nodes_to_outline:
-            bbox_poly = get_rounded_rect_path(
-                node, 
-                v2d, 
-                radius=pixel_radius,
-                thickness=bbox_width
-            )
-            if bbox_poly:
-                batch_node_bbox.append(bbox_poly)
 
     socket_index_cache = {}
     curv_factor = get_curving_factor()
     enable_type_colors = settings.get('enable_type_based_colors', False)
-    
+    width_backing = max(2.0, 9.0 * zoom)
+    width_main = max(1.5, settings.get('line_thickness', 2.0) * zoom)
+    batch_node_bbox = []
+
+
+
+    # 处理节点边框
+    if nodes_to_outline:
+        border_thickness = settings.get('node_border_thickness', 3.0)
+        bbox_width = max(border_pixel_size, border_thickness * border_pixel_size * zoom)
+        pixel_radius = max(3.0, 4.0 * zoom)
+
+        for node in nodes_to_outline:
+            node_masks = collect_node_socket_masks(node, v2d, zoom, bbox_width)
+            bbox_polys = get_rounded_rect_path(
+                node,
+                v2d,
+                radius=pixel_radius,
+                thickness=bbox_width,
+                socket_masks=node_masks,
+            )
+            for bbox_poly in bbox_polys:
+                if bbox_poly:
+                    batch_node_bbox.append(bbox_poly)
+
     # 存储每条连线的信息，用于后续绘制
     link_info_list = []
 
@@ -1455,26 +1743,30 @@ def draw_colorful_connections():
         pts = get_native_link_points(link, v2d, curv_factor, zoom)
         if not pts or len(pts) < 2:
             continue
-        
+
+        link_socket_masks = []
+        _append_socket_mask(link_socket_masks, set(), fs, v2d.view_to_region(l1x, l1y, clip=False), zoom, clip_width=width_main, extra_padding=0.2)
+        _append_socket_mask(link_socket_masks, set(), ts, v2d.view_to_region(l2x, l2y, clip=False), zoom, clip_width=width_main, extra_padding=0.2)
+        line_segments = split_polyline_by_socket_masks(pts, link_socket_masks)
+        if not line_segments:
+            continue
+
         # 性能优化：视口裁剪，跳过不可见的连线
         try:
             region = context.region
-            if not _is_link_visible(region, pts, margin=100):
+            if not any(_is_link_visible(region, segment, margin=100) for segment in line_segments):
                 continue
         except:
             # 如果无法获取 region，继续绘制（向后兼容）
             pass
-        
+
         # 保存连线信息和socket信息
         is_field = is_field_link(tree, link)
         link_info_list.append({
-            'pts': pts,
+            'pts': line_segments,
             'from_socket': fs,
             'to_socket': ts,
-            'start_pos': (pts[0][0], pts[0][1]),
-            'end_pos': (pts[-1][0], pts[-1][1]),
             'is_field': is_field,
-            'link': link  # 保存link引用以便后续使用
         })
 
     # 分离Field和Constant连线
@@ -1487,11 +1779,8 @@ def draw_colorful_connections():
         else:
             constant_links.append(link_info)
     
-    width_backing = max(2.0, 9.0 * zoom)
-    width_main = max(1.5, settings.get('line_thickness', 2.0) * zoom)
-
     # 1. Backing (底层背景) - 给所有连线画背景
-    all_backing = [info['pts'] for info in link_info_list]
+    all_backing = [segment for info in link_info_list for segment in info['pts']]
     if all_backing:
         # 从设置中获取底层背景颜色（draw_batch_lines会自动应用overall_opacity）
         backing_color_setting = settings.get('backing_color', (0.0, 0.0, 0.0, 0.55))
@@ -1505,10 +1794,10 @@ def draw_colorful_connections():
             )
         else:
             backing_color = (0.0, 0.0, 0.0, 0.55)
-        
+
         # 调试：打印颜色值（可以注释掉）
         # print(f"底层背景颜色: {backing_color}, 整体透明度: {overall_opacity}")
-        
+
         draw_batch_lines(all_backing, 'SMOOTH_COLOR', width_backing, colors=[backing_color], overall_opacity=overall_opacity)
 
     # 2. Main Lines - Constant连线：实线流动
@@ -1522,7 +1811,7 @@ def draw_colorful_connections():
                 if socket_type not in links_by_socket_type:
                     links_by_socket_type[socket_type] = []
                 links_by_socket_type[socket_type].append(link_info)
-            
+
             # 为每种socket类型批量绘制
             for socket_type, type_links in links_by_socket_type.items():
                 if not type_links:
@@ -1532,13 +1821,13 @@ def draw_colorful_connections():
                 ts = sample_link['to_socket']
                 link_colors = apply_type_based_color_shift(grad_cols, sample_link['from_socket'], ts, offset_strength=0.5)
                 # 批量绘制所有相同类型的连线
-                type_points = [info['pts'] for info in type_links]
+                type_points = [segment for info in type_links for segment in info['pts']]
                 draw_batch_lines(type_points, 'GRADIENT', width_main, colors=link_colors, time_sec=time_sec, overall_opacity=overall_opacity)
         else:
             # 所有连线使用相同颜色
-            constant_main = [info['pts'] for info in constant_links]
+            constant_main = [segment for info in constant_links for segment in info['pts']]
             draw_batch_lines(constant_main, 'GRADIENT', width_main, colors=grad_cols, time_sec=time_sec, overall_opacity=overall_opacity)
-    
+
     # 3. Field连线：使用Field配色方案（实线，不再使用虚线）
     if field_links:
         if enable_type_colors:
@@ -1550,7 +1839,7 @@ def draw_colorful_connections():
                 if socket_type not in field_links_by_socket_type:
                     field_links_by_socket_type[socket_type] = []
                 field_links_by_socket_type[socket_type].append(field_info)
-            
+
             # 为每种socket类型批量绘制
             for socket_type, type_links in field_links_by_socket_type.items():
                 if not type_links:
@@ -1560,81 +1849,14 @@ def draw_colorful_connections():
                 ts = sample_link['to_socket']
                 link_colors = apply_type_based_color_shift(field_grad_cols, sample_link['from_socket'], ts, offset_strength=0.5)
                 # 批量绘制所有相同类型的连线
-                type_points = [info['pts'] for info in type_links]
+                type_points = [segment for info in type_links for segment in info['pts']]
                 draw_batch_lines(type_points, 'GRADIENT', width_main, colors=link_colors, time_sec=time_sec, overall_opacity=overall_opacity)
         else:
             # 所有Field连线使用Field配色方案
-            field_main = [info['pts'] for info in field_links]
+            field_main = [segment for info in field_links for segment in info['pts']]
             draw_batch_lines(field_main, 'GRADIENT', width_main, colors=field_grad_cols, time_sec=time_sec, overall_opacity=overall_opacity)
 
-    # 3. Circles - 背景圆圈（给所有连线）
-    all_circles_backing = []
-    for info in link_info_list:
-        all_circles_backing.append(info['start_pos'])
-        all_circles_backing.append(info['end_pos'])
-    if all_circles_backing:
-        backing_circle_color = (0, 0, 0, 0.55 * overall_opacity)
-        draw_batch_circles(all_circles_backing, 7.0 * zoom, backing_circle_color, overall_opacity=overall_opacity)
-
-    # 端点圆圈 - 根据连线类型（Constant或Field）显示不同颜色
-    if enable_type_colors:
-        # 性能优化：按颜色和大小分组，批量绘制端点圆圈
-        circles_by_key = {}  # key: (color_tuple, size) -> list of positions
-        for link_info in link_info_list:
-            ts = link_info['to_socket']
-            sx, sy = link_info['start_pos']
-            tx, ty = link_info['end_pos']
-            is_field = link_info.get('is_field', False)
-            
-            # 根据连线类型选择颜色方案
-            base_cols = field_grad_cols if is_field else grad_cols
-            
-            # 起始端点
-            socket_color_start = apply_type_based_color_shift([base_cols[0] if base_cols else (1,1,1,1)], None, ts, offset_strength=0.5)[0]
-            socket_size_start = get_socket_circle_size(ts, zoom)
-            start_key = (socket_color_start, socket_size_start)
-            if start_key not in circles_by_key:
-                circles_by_key[start_key] = []
-            circles_by_key[start_key].append((sx, sy))
-            
-            # 结束端点
-            socket_color_end = apply_type_based_color_shift([base_cols[-1] if base_cols else (1,1,1,1)], None, ts, offset_strength=0.5)[0]
-            socket_size_end = get_socket_circle_size(ts, zoom)
-            end_key = (socket_color_end, socket_size_end)
-            if end_key not in circles_by_key:
-                circles_by_key[end_key] = []
-            circles_by_key[end_key].append((tx, ty))
-        
-        # 批量绘制所有相同颜色和大小的圆圈
-        for (color, size), positions in circles_by_key.items():
-            if positions:
-                draw_batch_circles(positions, size, color, overall_opacity=overall_opacity)
-    else:
-        # 根据连线类型使用不同的颜色方案
-        constant_start_positions = [info['start_pos'] for info in constant_links]
-        constant_end_positions = [info['end_pos'] for info in constant_links]
-        field_start_positions = [info['start_pos'] for info in field_links]
-        field_end_positions = [info['end_pos'] for info in field_links]
-        
-        # Constant连线端点
-        if constant_start_positions or constant_end_positions:
-            c_start = grad_cols[0] if grad_cols else (1,1,1,1)
-            c_end = grad_cols[-1] if grad_cols else c_start
-            if constant_start_positions:
-                draw_batch_circles(constant_start_positions, 5.0 * zoom, c_start, overall_opacity=overall_opacity)
-            if constant_end_positions:
-                draw_batch_circles(constant_end_positions, 5.0 * zoom, c_end, overall_opacity=overall_opacity)
-        
-        # Field连线端点
-        if field_start_positions or field_end_positions:
-            f_start = field_grad_cols[0] if field_grad_cols else (0.8, 0.2, 1.0, 1.0)
-            f_end = field_grad_cols[-1] if field_grad_cols else f_start
-            if field_start_positions:
-                draw_batch_circles(field_start_positions, 5.0 * zoom, f_start, overall_opacity=overall_opacity)
-            if field_end_positions:
-                draw_batch_circles(field_end_positions, 5.0 * zoom, f_end, overall_opacity=overall_opacity)
-
-    # 4. Node Borders
+    # 3. Node Borders
     if batch_node_bbox:
         draw_batch_lines(batch_node_bbox, 'GRADIENT', bbox_width, colors=grad_cols, time_sec=time_sec, overall_opacity=overall_opacity)
 

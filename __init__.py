@@ -30,8 +30,8 @@ from . import utils
 bl_info = {
     "name": "彩色连线",
     "author": "Blender超级技术交流社",
-    "version": (1, 0, 0),
-    "blender": (2, 80, 0),
+    "version": (1, 1, 2),
+    "blender": (4, 2, 0),
     "location": "节点编辑器 > 侧边栏",
     "description": "为Blender节点编辑器提供彩色连线功能，增强节点编辑体验",
     "warning": "",
