@@ -4,6 +4,127 @@ import os
 
 # 全局变量初始化
 _loading_settings = False
+_AUTOSAVE_DELAY = 0.25
+_pending_save_settings = None
+_autosave_timer_registered = False
+
+
+def _safe_get_scene(prefer_context=True):
+    scene = None
+    if prefer_context:
+        try:
+            if hasattr(bpy, 'context') and hasattr(bpy.context, 'scene'):
+                scene = bpy.context.scene
+        except Exception:
+            scene = None
+
+    if scene and hasattr(scene, 'colorful_connections_settings'):
+        return scene
+
+    try:
+        if hasattr(bpy, 'data') and hasattr(bpy.data, 'scenes') and bpy.data.scenes:
+            for candidate in bpy.data.scenes:
+                if hasattr(candidate, 'colorful_connections_settings'):
+                    return candidate
+    except Exception:
+        pass
+    return None
+
+
+def _ensure_default_gradient_colors(settings):
+    try:
+        if len(settings.gradient_colors) == 0:
+            settings.gradient_color_count = 5
+            settings._update_color_count()
+    except (AttributeError, RuntimeError, ReferenceError) as e:
+        print(f"设置gradient_color_count失败: {e}")
+
+    try:
+        if len(settings.field_gradient_colors) == 0:
+            settings.field_gradient_color_count = 5
+            settings._update_field_color_count()
+    except (AttributeError, RuntimeError, ReferenceError) as e:
+        print(f"设置field_gradient_color_count失败: {e}")
+
+    try:
+        if len(settings.endpoint_gradient_colors) == 0:
+            settings.endpoint_gradient_color_count = 5
+            settings._update_endpoint_color_count()
+    except (AttributeError, RuntimeError, ReferenceError) as e:
+        print(f"设置endpoint_gradient_color_count失败: {e}")
+
+
+def _apply_initial_preset_if_needed(settings):
+    try:
+        if len(settings.gradient_presets) == 0 or len(settings.gradient_colors) != 0:
+            return
+
+        preset_to_apply = None
+        preset_index_to_use = -1
+
+        last_applied = getattr(settings, 'last_applied_preset_index', -1)
+        if last_applied >= 0 and last_applied < len(settings.gradient_presets):
+            preset_index_to_use = last_applied
+            preset_to_apply = settings.gradient_presets[last_applied]
+            settings.active_preset_index = last_applied
+        elif settings.active_preset_index >= 0 and settings.active_preset_index < len(settings.gradient_presets):
+            preset_index_to_use = settings.active_preset_index
+            preset_to_apply = settings.gradient_presets[settings.active_preset_index]
+        else:
+            preset_index_to_use = 0
+            preset_to_apply = settings.gradient_presets[0]
+            settings.active_preset_index = 0
+
+        if not preset_to_apply:
+            return
+
+        settings.gradient_colors.clear()
+        for preset_color in preset_to_apply.colors:
+            new_color = settings.gradient_colors.add()
+            new_color.color = preset_color.color[:]
+            new_color.alpha = getattr(preset_color, 'alpha', 1.0)
+        settings.gradient_color_count = len(preset_to_apply.colors)
+        settings.active_preset_index = preset_index_to_use
+        settings.last_applied_preset_index = preset_index_to_use
+        print(f"已自动应用预设: {preset_to_apply.name} (索引: {preset_index_to_use})")
+    except (AttributeError, RuntimeError, ReferenceError) as e:
+        print(f"处理预设失败: {e}")
+    except Exception as e:
+        print(f"自动应用预设失败: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+def _initialize_scene_settings(scene=None):
+    if scene is None:
+        scene = _safe_get_scene()
+    if not scene or not hasattr(scene, 'colorful_connections_settings'):
+        return False
+
+    try:
+        _ = scene.name
+        settings = scene.colorful_connections_settings
+    except (AttributeError, RuntimeError, ReferenceError) as e:
+        print(f"场景不可访问: {e}")
+        return False
+
+    try:
+        load_presets_from_file(settings)
+    except Exception as e:
+        print(f"加载预设失败: {e}")
+        import traceback
+        traceback.print_exc()
+
+    try:
+        load_global_settings(settings)
+    except Exception as e:
+        print(f"加载全局设置失败: {e}")
+        import traceback
+        traceback.print_exc()
+
+    _ensure_default_gradient_colors(settings)
+    _apply_initial_preset_if_needed(settings)
+    return True
 
 # 获取全局设置文件路径
 def get_settings_filepath():
@@ -194,7 +315,7 @@ def _save_global_settings_internal(settings):
 # 从文件加载全局设置
 def load_global_settings(settings):
     """从JSON文件加载全局设置（安全版本，检查上下文可写性）"""
-    global _loading_settings
+    global _loading_settings, _pending_save_settings
     
     # 检查 settings 是否有效
     if not settings:
@@ -346,6 +467,7 @@ def load_global_settings(settings):
         traceback.print_exc()
     finally:
         _loading_settings = False
+        _pending_save_settings = None
 
 # 从文件加载预设
 def load_presets_from_file(settings):
@@ -420,17 +542,42 @@ def _get_settings_from_context(context=None):
     return None
 
 
+def _flush_pending_settings_save():
+    global _pending_save_settings, _autosave_timer_registered
+    _autosave_timer_registered = False
+
+    if _loading_settings:
+        return None
+
+    settings = _pending_save_settings
+    _pending_save_settings = None
+    if settings is None:
+        return None
+
+    try:
+        _ = settings.enable_colorful_connections
+    except (AttributeError, RuntimeError, ReferenceError):
+        return None
+
+    _save_global_settings_internal(settings)
+    return None
+
 def _autosave_settings(context=None):
-    global _loading_settings
+    global _loading_settings, _pending_save_settings, _autosave_timer_registered
     if _loading_settings:
         return
 
     settings = _get_settings_from_context(context)
-    if settings is not None:
-        _save_global_settings_internal(settings)
+    if settings is None:
+        return
 
+    _pending_save_settings = settings
+    if _autosave_timer_registered:
+        return
 
-# 辅助函数：颜色更新回调
+    bpy.app.timers.register(_flush_pending_settings_save, first_interval=_AUTOSAVE_DELAY)
+    _autosave_timer_registered = True
+
 
 def _gradient_color_update(self, context):
     """颜色更新时的回调"""
@@ -445,10 +592,12 @@ def _save_and_redraw_update(self, context):
 def _force_redraw_update():
     """当底层背景颜色改变时，强制触发重绘"""
     try:
-        for area in bpy.context.screen.areas:
-            if area.type == 'NODE_EDITOR':
-                area.tag_redraw()
-    except:
+        for wm in bpy.data.window_managers:
+            for window in wm.windows:
+                for area in window.screen.areas:
+                    if area.type == 'NODE_EDITOR':
+                        area.tag_redraw()
+    except Exception:
         pass  # 如果context不可用，忽略错误
 
 # 预设方案数据结构
@@ -1099,230 +1248,35 @@ def on_load_post(dummy):
     # 使用延迟执行，确保场景完全加载
     def init_after_load():
         try:
-            # 检查是否可以安全地访问场景
-            if not hasattr(bpy, 'data') or not hasattr(bpy.data, 'scenes'):
-                return None
-            
-            # 获取所有场景（使用 bpy.data.scenes 而不是 bpy.context.scene）
-            scenes = bpy.data.scenes
-            if not scenes:
-                return None
-            
-            # 遍历所有场景，但主要处理当前活动场景
-            scene = None
-            try:
-                # 尝试获取 context 中的场景（如果可用）
-                if hasattr(bpy, 'context') and hasattr(bpy.context, 'scene'):
-                    try:
-                        scene = bpy.context.scene
-                    except:
-                        pass
-            except:
-                pass
-            
-            # 如果无法从 context 获取，使用第一个场景
-            if not scene or not hasattr(scene, 'colorful_connections_settings'):
-                if scenes:
-                    scene = scenes[0]
-            
-            if not scene or not hasattr(scene, 'colorful_connections_settings'):
-                return None
-            
-            # 检查场景是否可写（避免在不安全上下文中修改）
-            try:
-                # 尝试只读访问来测试场景是否可用
-                _ = scene.name
-                settings = scene.colorful_connections_settings
-            except (AttributeError, RuntimeError, ReferenceError) as e:
-                print(f"场景不可访问: {e}")
-                return None
-            
-            # 从插件目录重新加载预设和设置（不从场景读取）
-            try:
-                load_presets_from_file(settings)
-            except Exception as e:
-                print(f"加载预设失败: {e}")
-                import traceback
-                traceback.print_exc()
-            
-            try:
-                load_global_settings(settings)
-            except Exception as e:
-                print(f"加载全局设置失败: {e}")
-                import traceback
-                traceback.print_exc()
-            
-            # 如果颜色为空，设置默认值（使用安全的方式）
-            try:
-                if len(settings.gradient_colors) == 0:
-                    # 设置颜色数量会触发 _update_color_count，此时在timer中是安全的
-                    settings.gradient_color_count = 5
-                    # 额外强制更新一次，以防之前的 update 被 AttributeErr 忽略
-                    settings._update_color_count()
-            except (AttributeError, RuntimeError, ReferenceError) as e:
-                print(f"设置gradient_color_count失败: {e}")
-            
-            try:
-                if len(settings.field_gradient_colors) == 0:
-                    settings.field_gradient_color_count = 5
-                    # 额外强制更新一次
-                    settings._update_field_color_count()
-            except (AttributeError, RuntimeError, ReferenceError) as e:
-                print(f"设置field_gradient_color_count失败: {e}")
-
-            try:
-                if len(settings.endpoint_gradient_colors) == 0:
-                    settings.endpoint_gradient_color_count = 5
-                    settings._update_endpoint_color_count()
-            except (AttributeError, RuntimeError, ReferenceError) as e:
-                print(f"设置endpoint_gradient_color_count失败: {e}")
-            
-            # 如果有预设，尝试应用（使用安全的方式）
-            try:
-                if len(settings.gradient_presets) > 0:
-                    preset_index = getattr(settings, 'last_applied_preset_index', -1)
-                    if preset_index < 0 or preset_index >= len(settings.gradient_presets):
-                        preset_index = 0
-                    
-                    if len(settings.gradient_colors) == 0 and preset_index < len(settings.gradient_presets):
-                        preset = settings.gradient_presets[preset_index]
-                        # 安全地清空和添加颜色
-                        settings.gradient_colors.clear()
-                        for preset_color in preset.colors:
-                            new_color = settings.gradient_colors.add()
-                            new_color.color = preset_color.color[:]
-                            new_color.alpha = getattr(preset_color, 'alpha', 1.0)
-                        settings.gradient_color_count = len(preset.colors)
-                        settings.active_preset_index = preset_index
-            except (AttributeError, RuntimeError, ReferenceError) as e:
-                print(f"应用预设失败: {e}")
+            _initialize_scene_settings()
         except Exception as e:
             print(f"加载后初始化失败: {e}")
             import traceback
             traceback.print_exc()
         return None  # timer 只执行一次
-    
+
     # 延迟0.5秒执行，确保场景完全加载
     bpy.app.timers.register(init_after_load, first_interval=0.5)
 
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
-    
+
     bpy.types.Scene.colorful_connections_settings = bpy.props.PointerProperty(type=ColorfulConnectionsSettings)
-    
+
     # 注册场景加载后的回调
     if on_load_post not in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.append(on_load_post)
-    
+
     # 初始化默认颜色和加载设置（插件启用时）
     def init_default_colors():
         try:
-            # 安全地获取场景
-            scene = None
-            try:
-                if hasattr(bpy, 'context') and hasattr(bpy.context, 'scene'):
-                    scene = bpy.context.scene
-            except:
-                # 如果 context 不可用，尝试从 bpy.data.scenes 获取
-                if hasattr(bpy, 'data') and hasattr(bpy.data, 'scenes') and bpy.data.scenes:
-                    scene = bpy.data.scenes[0]
-            
-            if not scene or not hasattr(scene, 'colorful_connections_settings'):
-                return
-            
-            try:
-                settings = scene.colorful_connections_settings
-            except (AttributeError, RuntimeError, ReferenceError):
-                return
-            
-            # 从插件目录加载预设（不从场景读取）
-            try:
-                load_presets_from_file(settings)
-            except Exception as e:
-                print(f"加载预设失败: {e}")
-                import traceback
-                traceback.print_exc()
-            
-            # 从插件目录加载全局设置（不从场景读取）
-            try:
-                load_global_settings(settings)
-            except Exception as e:
-                print(f"加载全局设置失败: {e}")
-                import traceback
-                traceback.print_exc()
-            
-            # 如果颜色为空，设置默认值
-            try:
-                if len(settings.gradient_colors) == 0:
-                    settings.gradient_color_count = 5  # 这会触发 _update_color_count
-                    settings._update_color_count() # 确保触发
-            except (AttributeError, RuntimeError, ReferenceError) as e:
-                print(f"设置gradient_color_count失败: {e}")
-            
-            # 如果Field颜色为空，设置默认值
-            try:
-                if len(settings.field_gradient_colors) == 0:
-                    settings.field_gradient_color_count = 5  # 这会触发 _update_field_color_count
-                    settings._update_field_color_count() # 确保触发
-            except (AttributeError, RuntimeError, ReferenceError) as e:
-                print(f"设置field_gradient_color_count失败: {e}")
-
-            # 如果端点空心罩颜色为空，设置默认值
-            try:
-                if len(settings.endpoint_gradient_colors) == 0:
-                    settings.endpoint_gradient_color_count = 5  # 这会触发 _update_endpoint_color_count
-                    settings._update_endpoint_color_count() # 确保触发
-            except (AttributeError, RuntimeError, ReferenceError) as e:
-                print(f"设置endpoint_gradient_color_count失败: {e}")
-            
-            # 预设加载优先级：最后应用的 > 最后保存的 > 第一个 > 默认值
-            try:
-                if len(settings.gradient_presets) > 0:
-                    preset_to_apply = None
-                    preset_index_to_use = -1
-                    
-                    # 优先级1：最后应用的预设
-                    last_applied = getattr(settings, 'last_applied_preset_index', -1)
-                    if last_applied >= 0 and last_applied < len(settings.gradient_presets):
-                        preset_index_to_use = last_applied
-                        preset_to_apply = settings.gradient_presets[last_applied]
-                        settings.active_preset_index = last_applied  # 更新UI显示
-                    # 优先级2：最后保存的预设（active_preset_index）
-                    elif settings.active_preset_index >= 0 and settings.active_preset_index < len(settings.gradient_presets):
-                        preset_index_to_use = settings.active_preset_index
-                        preset_to_apply = settings.gradient_presets[settings.active_preset_index]
-                        # active_preset_index 已经正确，无需更新
-                    # 优先级3：第一个预设
-                    else:
-                        preset_index_to_use = 0
-                        preset_to_apply = settings.gradient_presets[0]
-                        settings.active_preset_index = 0
-                    
-                    # 如果找到有效的预设，且当前颜色为空，则应用它
-                    if preset_to_apply and len(settings.gradient_colors) == 0:
-                        try:
-                            # 应用预设颜色
-                            settings.gradient_colors.clear()
-                            for preset_color in preset_to_apply.colors:
-                                new_color = settings.gradient_colors.add()
-                                new_color.color = preset_color.color[:]
-                                new_color.alpha = getattr(preset_color, 'alpha', 1.0)
-                            settings.gradient_color_count = len(preset_to_apply.colors)
-                            settings.active_preset_index = preset_index_to_use
-                            settings.last_applied_preset_index = preset_index_to_use
-                            print(f"已自动应用预设: {preset_to_apply.name} (索引: {preset_index_to_use})")
-                        except Exception as e:
-                            print(f"自动应用预设失败: {e}")
-                            import traceback
-                            traceback.print_exc()
-            except (AttributeError, RuntimeError, ReferenceError) as e:
-                print(f"处理预设失败: {e}")
+            _initialize_scene_settings(_safe_get_scene())
         except Exception as e:
             print(f"初始化设置失败: {e}")
             import traceback
             traceback.print_exc()
-    
+
     # 延迟初始化
     bpy.app.timers.register(init_default_colors, first_interval=0.1)
 

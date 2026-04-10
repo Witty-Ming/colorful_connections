@@ -1009,6 +1009,7 @@ def get_rounded_rect_path(node, v2d, radius=4.0, resolution=12, thickness=0.0, s
     
 draw_handler = None
 last_time = 0
+_redraw_timer_interval = 0.1
 _SHADER_CACHE = {}
 
 # 用于存储固定的流状态
@@ -1224,16 +1225,17 @@ def _rainbow_rgba(step_t, time_sec):
     r, g, b = colorsys.hsv_to_rgb(hue, saturation * sat_damp, min(1.0, value * boost))
     return (r, g, b, 1.0)
 
-def get_native_link_points(link, v2d, curv, zoom_factor=1.0):
+def get_native_link_points(link, v2d, curv, zoom_factor=1.0, socket_index_cache=None):
     """获取连线点列表，根据缩放级别优化采样点数"""
     fs, ts = link.from_socket, link.to_socket
+    cache = socket_index_cache if socket_index_cache is not None else {}
     try:
         if not (fs.enabled and ts.enabled):
             return None
         from_node = link.from_node
         to_node = link.to_node
-        from_idx = _get_socket_index_cached({}, from_node, fs, True) or 0
-        to_idx = _get_socket_index_cached({}, to_node, ts, False) or 0
+        from_idx = _get_socket_index_cached(cache, from_node, fs, True) or 0
+        to_idx = _get_socket_index_cached(cache, to_node, ts, False) or 0
         x1, y1 = get_socket_loc(from_node, True, from_idx)
         x2, y2 = get_socket_loc(to_node, False, to_idx)
     except Exception:
@@ -1244,7 +1246,7 @@ def get_native_link_points(link, v2d, curv, zoom_factor=1.0):
     y2 += y_off
 
     v2r = v2d.view_to_region
-    
+
     # 性能优化：根据缩放级别动态调整采样点数
     # 缩放级别越低（视图越远），使用越少的采样点
     if zoom_factor > 0.5:
@@ -1284,7 +1286,7 @@ def get_native_link_points(link, v2d, curv, zoom_factor=1.0):
     p3 = (x2, y2)
     p1 = (x1 + handle_offset, y1)
     p2 = (x2 - handle_offset, y2)
-    
+
     pts = []
     for i in range(seg + 1):
         t = i / seg
@@ -1897,7 +1899,8 @@ def draw_colorful_connections():
 
     gpu.state.blend_set('ALPHA')
 
-    v2d = context.region.view2d
+    region = context.region
+    v2d = region.view2d
     zoom = _view2d_zoom_factor(v2d)
     border_pixel_size = get_layout_metrics()['pixel_size']
 
@@ -1944,6 +1947,11 @@ def draw_colorful_connections():
 
     # 存储每条连线的信息，用于后续绘制
     link_info_list = []
+    backing_segments = []
+    constant_main_segments = []
+    field_main_segments = []
+    constant_type_segments = {}
+    field_type_segments = {}
 
     for link in links_to_draw:
         fs = getattr(link, "from_socket", None)
@@ -1965,8 +1973,11 @@ def draw_colorful_connections():
             continue
 
         # 性能优化：根据缩放级别调整采样点数
-        pts = get_native_link_points(link, v2d, curv_factor, zoom)
+        pts = get_native_link_points(link, v2d, curv_factor, zoom, socket_index_cache=socket_index_cache)
         if not pts or len(pts) < 2:
+            continue
+
+        if not _is_link_visible(region, pts, margin=100):
             continue
 
         from_center = v2d.view_to_region(l1x, l1y, clip=False)
@@ -1977,15 +1988,6 @@ def draw_colorful_connections():
         line_segments = split_polyline_by_socket_masks(pts, link_socket_masks)
         if not line_segments:
             continue
-
-        # 性能优化：视口裁剪，跳过不可见的连线
-        try:
-            region = context.region
-            if not any(_is_link_visible(region, segment, margin=100) for segment in line_segments):
-                continue
-        except:
-            # 如果无法获取 region，继续绘制（向后兼容）
-            pass
 
         # 保存连线信息和socket信息
         is_field = is_field_link(tree, link)
@@ -2022,6 +2024,22 @@ def draw_colorful_connections():
             'colors': link_colors,
         })
 
+        backing_segments.extend(line_segments)
+        if is_field:
+            if enable_type_colors:
+                socket_type = get_socket_type_name(ts)
+                field_type_segments.setdefault(socket_type, {'segments': [], 'colors': link_colors})
+                field_type_segments[socket_type]['segments'].extend(line_segments)
+            else:
+                field_main_segments.extend(line_segments)
+        else:
+            if enable_type_colors:
+                socket_type = get_socket_type_name(ts)
+                constant_type_segments.setdefault(socket_type, {'segments': [], 'colors': link_colors})
+                constant_type_segments[socket_type]['segments'].extend(line_segments)
+            else:
+                constant_main_segments.extend(line_segments)
+
     for node in nodes_to_outline:
         collect_node_socket_overlays(
             node,
@@ -2034,19 +2052,8 @@ def draw_colorful_connections():
             overlay_size=endpoint_overlay_size,
         )
 
-    # 分离Field和Constant连线
-    field_links = []
-    constant_links = []
-
-    for link_info in link_info_list:
-        if link_info.get('is_field', False):
-            field_links.append(link_info)
-        else:
-            constant_links.append(link_info)
-
     # 1. Backing (底层背景) - 给所有连线画背景
-    all_backing = [segment for info in link_info_list for segment in info['pts']]
-    if all_backing:
+    if backing_segments:
         # 从设置中获取底层背景颜色（draw_batch_lines会自动应用overall_opacity）
         backing_color_setting = settings.get('backing_color', (0.0, 0.0, 0.0, 0.55))
         # 确保是RGBA格式的tuple，并确保所有值都是float
@@ -2063,69 +2070,39 @@ def draw_colorful_connections():
         # 调试：打印颜色值（可以注释掉）
         # print(f"底层背景颜色: {backing_color}, 整体透明度: {overall_opacity}")
 
-        draw_batch_lines(all_backing, 'SMOOTH_COLOR', width_backing, colors=[backing_color], overall_opacity=overall_opacity)
+        draw_batch_lines(backing_segments, 'SMOOTH_COLOR', width_backing, colors=[backing_color], overall_opacity=overall_opacity)
 
     # 2. Main Lines - Constant连线：实线流动
-    if constant_links:
-        if enable_type_colors:
-            # 性能优化：按socket类型分组，批量绘制相同类型的连线
-            links_by_socket_type = {}
-            for link_info in constant_links:
-                ts = link_info['to_socket']
-                socket_type = get_socket_type_name(ts)
-                if socket_type not in links_by_socket_type:
-                    links_by_socket_type[socket_type] = []
-                links_by_socket_type[socket_type].append(link_info)
-
-            # 为每种socket类型批量绘制
-            for socket_type, type_links in links_by_socket_type.items():
-                if not type_links:
-                    continue
-                # 获取该类型的颜色偏移
-                sample_link = type_links[0]
-                draw_batch_lines(
-                    [segment for info in type_links for segment in info['pts']],
-                    'GRADIENT',
-                    width_main,
-                    colors=sample_link['colors'],
-                    time_sec=time_sec,
-                    overall_opacity=overall_opacity,
-                )
-        else:
-            # 所有连线使用相同颜色
-            constant_main = [segment for info in constant_links for segment in info['pts']]
-            draw_batch_lines(constant_main, 'GRADIENT', width_main, colors=grad_cols, time_sec=time_sec, overall_opacity=overall_opacity)
+    if enable_type_colors:
+        for type_group in constant_type_segments.values():
+            if not type_group['segments']:
+                continue
+            draw_batch_lines(
+                type_group['segments'],
+                'GRADIENT',
+                width_main,
+                colors=type_group['colors'],
+                time_sec=time_sec,
+                overall_opacity=overall_opacity,
+            )
+    elif constant_main_segments:
+        draw_batch_lines(constant_main_segments, 'GRADIENT', width_main, colors=grad_cols, time_sec=time_sec, overall_opacity=overall_opacity)
 
     # 3. Field连线：使用Field配色方案（实线，不再使用虚线）
-    if field_links:
-        if enable_type_colors:
-            # 性能优化：按socket类型分组，批量绘制相同类型的连线
-            field_links_by_socket_type = {}
-            for field_info in field_links:
-                ts = field_info['to_socket']
-                socket_type = get_socket_type_name(ts)
-                if socket_type not in field_links_by_socket_type:
-                    field_links_by_socket_type[socket_type] = []
-                field_links_by_socket_type[socket_type].append(field_info)
-
-            # 为每种socket类型批量绘制
-            for socket_type, type_links in field_links_by_socket_type.items():
-                if not type_links:
-                    continue
-                # 获取该类型的颜色偏移
-                sample_link = type_links[0]
-                draw_batch_lines(
-                    [segment for info in type_links for segment in info['pts']],
-                    'GRADIENT',
-                    width_main,
-                    colors=sample_link['colors'],
-                    time_sec=time_sec,
-                    overall_opacity=overall_opacity,
-                )
-        else:
-            # 所有Field连线使用Field配色方案
-            field_main = [segment for info in field_links for segment in info['pts']]
-            draw_batch_lines(field_main, 'GRADIENT', width_main, colors=field_grad_cols, time_sec=time_sec, overall_opacity=overall_opacity)
+    if enable_type_colors:
+        for type_group in field_type_segments.values():
+            if not type_group['segments']:
+                continue
+            draw_batch_lines(
+                type_group['segments'],
+                'GRADIENT',
+                width_main,
+                colors=type_group['colors'],
+                time_sec=time_sec,
+                overall_opacity=overall_opacity,
+            )
+    elif field_main_segments:
+        draw_batch_lines(field_main_segments, 'GRADIENT', width_main, colors=field_grad_cols, time_sec=time_sec, overall_opacity=overall_opacity)
 
     # 3. Node Borders
     if batch_node_bbox:
@@ -2161,8 +2138,14 @@ def draw_colorful_connections():
     else:
         redraw_interval = 0.1  # 少量连线，正常刷新频率
 
+    _ensure_redraw_timer(redraw_interval)
+
+def _ensure_redraw_timer(interval):
+    global _redraw_timer_interval
+    _redraw_timer_interval = max(0.01, float(interval))
     if not bpy.app.timers.is_registered(force_redraw):
-        bpy.app.timers.register(force_redraw, first_interval=redraw_interval)
+        bpy.app.timers.register(force_redraw, first_interval=_redraw_timer_interval)
+
 
 def force_redraw():
     try:
@@ -2171,9 +2154,9 @@ def force_redraw():
                 for area in window.screen.areas:
                     if area.type == 'NODE_EDITOR':
                         area.tag_redraw()
-    except:
+    except Exception:
         pass
-    return None
+    return _redraw_timer_interval
 
 def register():
     global draw_handler, _SHADER_CACHE

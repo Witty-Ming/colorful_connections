@@ -2,7 +2,6 @@
   "trace_mode": "ACTIVE_FLOW",
   "flow_direction": "BOTH",
   "lock_flow": false,
-  "enable_type_based_colors": false,
   "connection_color_type": "CUSTOM",
   "gradient_color_count": 5,
   "gradient_colors": [
@@ -90,54 +89,9 @@
       "alpha": 0.0
     }
   ],
-  "endpoint_gradient_color_count": 5,
-  "endpoint_gradient_colors": [
-    {
-      "color": [
-        0.0,
-        0.5,
-        1.0
-      ],
-      "alpha": 1.0
-    },
-    {
-      "color": [
-        0.0,
-        1.0,
-        0.800000011920929
-      ],
-      "alpha": 1.0
-    },
-    {
-      "color": [
-        1.0,
-        1.0,
-        0.0
-      ],
-      "alpha": 1.0
-    },
-    {
-      "color": [
-        1.0,
-        0.5,
-        0.0
-      ],
-      "alpha": 1.0
-    },
-    {
-      "color": [
-        1.0,
-        0.0,
-        0.5
-      ],
-      "alpha": 1.0
-    }
-  ],
   "animation_speed": 2.0,
   "line_thickness": 5.8899993896484375,
   "node_border_thickness": 1.2999999523162842,
-  "endpoint_overlay_size": 1.0,
-  "endpoint_overlay_thickness": 0.7799999713897705,
   "enable_colorful_connections": true,
   "overall_opacity": 1.0,
   "backing_color_rgb": [
