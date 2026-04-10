@@ -703,6 +703,15 @@ def split_polyline_by_socket_masks(points, socket_masks):
     return [segment for segment in segments if len(segment) >= 2]
 
 
+def _get_socket_pointer(socket):
+    if not socket:
+        return None
+    try:
+        return socket.as_pointer()
+    except Exception:
+        return id(socket)
+
+
 SOCKET_MASK_SHAPES = {
     'CIRCLE': 0.0,
     'SQUARE': 1.0,
@@ -715,7 +724,7 @@ def get_socket_shape_name(socket):
     if shape.endswith('_DOT'):
         shape = shape[:-4]
     if shape not in SOCKET_MASK_SHAPES:
-        shape = 'CIRCLE'
+        shape = 'SQUARE' if get_socket_type_name(socket) == 'NodeSocketGeometry' else 'CIRCLE'
     return shape
 
 
@@ -726,20 +735,50 @@ def get_socket_mask_radius(socket, zoom, clip_width=0.0, extra_padding=0.0):
         base_radius = 4.45 * zoom
     elif shape == 'DIAMOND':
         base_radius = 4.7 * zoom
+    elif shape == 'GEOMETRY_TALL':
+        base_radius = 4.45 * zoom
 
     line_padding = max(0.0, clip_width) * 0.08
     return max(base_radius + line_padding + extra_padding, 3.8 * zoom + 0.35)
+
+
+def get_socket_overlay_shape_name(socket):
+    if get_socket_type_name(socket) == 'NodeSocketGeometry':
+        return 'GEOMETRY_TALL'
+    return get_socket_shape_name(socket)
+
+
+def get_socket_overlay_dims(socket, zoom, clip_width=0.0, extra_padding=0.0, overlay_size=1.0):
+    shape_name = get_socket_overlay_shape_name(socket)
+    base_radius = get_socket_mask_radius(socket, zoom, clip_width=clip_width, extra_padding=extra_padding)
+    overlay_scale = max(0.1, float(overlay_size))
+    shape_scale = 0.84 if shape_name == 'SQUARE' else 1.0
+    if shape_name != 'GEOMETRY_TALL':
+        radius = base_radius * overlay_scale * shape_scale
+        return shape_name, radius, radius
+
+    metrics = get_layout_metrics()
+    half_width = max(base_radius, 4.0 * zoom + max(0.0, clip_width) * 0.05) * overlay_scale * 0.76
+    row_half_height = metrics['socket_row_height'] * 0.5
+    desired_half_height = max(
+        half_width * 1.35,
+        row_half_height * 0.72,
+        7.2 * zoom + max(0.0, clip_width) * 0.08 + extra_padding * 0.45,
+    ) * overlay_scale * 0.9
+    max_half_height = max(row_half_height - metrics['pixel_size'], half_width * 1.15)
+    half_height = min(desired_half_height, max_half_height)
+    half_height = max(half_height, half_width * 1.15)
+    return shape_name, half_width, half_height
+
+
+
 
 
 def _append_socket_mask(masks, seen_sockets, socket, center, zoom, clip_width=0.0, extra_padding=0.0):
     if not socket or not center:
         return
 
-    try:
-        socket_ptr = socket.as_pointer()
-    except Exception:
-        socket_ptr = id(socket)
-
+    socket_ptr = _get_socket_pointer(socket)
     if socket_ptr in seen_sockets:
         return
 
@@ -766,6 +805,107 @@ def collect_node_socket_masks(node, v2d, zoom, border_width=0.0):
             _append_socket_mask(masks, seen_sockets, socket, center, zoom, clip_width=border_width)
 
     return masks
+
+
+def _get_socket_overlay_path(center, shape_name, half_width, half_height=None, resolution=20):
+    if not center or half_width <= 0.0:
+        return []
+
+    if half_height is None:
+        half_height = half_width
+    if half_height <= 0.0:
+        return []
+
+    cx, cy = float(center[0]), float(center[1])
+    if shape_name == 'SQUARE':
+        path = [
+            (cx - half_width, cy - half_height),
+            (cx + half_width, cy - half_height),
+            (cx + half_width, cy + half_height),
+            (cx - half_width, cy + half_height),
+            (cx - half_width, cy - half_height),
+        ]
+        return path
+
+    if shape_name == 'GEOMETRY_TALL':
+        path = [
+            (cx - half_width, cy - half_height),
+            (cx + half_width, cy - half_height),
+            (cx + half_width, cy + half_height),
+            (cx - half_width, cy + half_height),
+            (cx - half_width, cy - half_height),
+        ]
+        return path
+
+    if shape_name == 'DIAMOND':
+        path = [
+            (cx, cy - half_height),
+            (cx + half_width, cy),
+            (cx, cy + half_height),
+            (cx - half_width, cy),
+            (cx, cy - half_height),
+        ]
+        return path
+
+    path = []
+    steps = max(8, int(resolution))
+    for i in range(steps + 1):
+        angle = (i / steps) * (2.0 * pi)
+        path.append((cx + cos(angle) * half_width, cy + sin(angle) * half_height))
+    return path
+
+
+
+
+def append_socket_overlay(target_list, seen_sockets, socket, center, zoom, width, colors=None, overlay_size=1.0):
+    if not socket or not center:
+        return
+
+    socket_ptr = _get_socket_pointer(socket)
+    if socket_ptr in seen_sockets:
+        return
+
+    shape_name, half_width, half_height = get_socket_overlay_dims(
+        socket,
+        zoom,
+        clip_width=width,
+        extra_padding=max(0.35, width * 0.12),
+        overlay_size=overlay_size,
+    )
+    path = _get_socket_overlay_path(center, shape_name, half_width, half_height)
+    if len(path) < 2:
+        return
+
+    target_list.append({
+        'path': path,
+        'socket': socket,
+        'colors': colors,
+    })
+    seen_sockets.add(socket_ptr)
+
+
+def collect_node_socket_overlays(node, v2d, zoom, width, target_list, seen_sockets, colors=None, overlay_size=1.0):
+    for is_output, sockets in ((False, getattr(node, 'inputs', [])), (True, getattr(node, 'outputs', []))):
+        for idx, socket in enumerate(sockets):
+            if not getattr(socket, 'enabled', True):
+                continue
+            try:
+                sx, sy = get_socket_loc(node, is_output, idx)
+                center = v2d.view_to_region(sx, sy, clip=False)
+            except Exception:
+                continue
+
+            append_socket_overlay(
+                target_list,
+                seen_sockets,
+                socket,
+                center,
+                zoom,
+                width,
+                colors=colors,
+                overlay_size=overlay_size,
+            )
+
 
 
 def _node_location_absolute(node):
@@ -1249,41 +1389,79 @@ def _get_socket_index_cached(cache, node, socket, is_output):
 def _get_line_strip_geometry(vertices, width):
     if len(vertices) < 2:
         return [], []
+
+    closed_loop = len(vertices) >= 4 and (Vector(vertices[0]) - Vector(vertices[-1])).length <= 1e-4
+    verts = [Vector(v) for v in vertices]
+    if closed_loop:
+        verts = verts[:-1]
+        if len(verts) < 3:
+            return [], []
+
     pos_data = []
     uv_data = []
     half_w = width * 0.5
-    count = len(vertices)
-    verts = [Vector(v) for v in vertices]
-    
+    count = len(verts)
+
+    if closed_loop:
+        distances = [0.0]
+        total_length = 0.0
+        for i in range(count):
+            dist = (verts[(i + 1) % count] - verts[i]).length
+            total_length += dist
+            if i < count - 1:
+                distances.append(total_length)
+
+        for i in range(count + 1):
+            curr_idx = i % count
+            prev_p = verts[(curr_idx - 1) % count]
+            curr_p = verts[curr_idx]
+            next_p = verts[(curr_idx + 1) % count]
+
+            t1 = (curr_p - prev_p).normalized()
+            t2 = (next_p - curr_p).normalized()
+            tangent = (t1 + t2).normalized()
+            if tangent.length_squared == 0.0:
+                tangent = t2 if t2.length_squared > 0.0 else t1
+            normal = Vector((-tangent.y, tangent.x))
+
+            p0 = curr_p + normal * half_w
+            p1 = curr_p - normal * half_w
+            pos_data.append((p0.x, p0.y))
+            pos_data.append((p1.x, p1.y))
+
+            u = 1.0 if i == count else (distances[curr_idx] / total_length if total_length > 0.0 else 0.0)
+            uv_data.append((u, 1.0))
+            uv_data.append((u, -1.0))
+        return pos_data, uv_data
+
     distances = [0.0]
     total_length = 0.0
     for i in range(count - 1):
-        dist = (verts[i+1] - verts[i]).length
+        dist = (verts[i + 1] - verts[i]).length
         total_length += dist
         distances.append(total_length)
-    
+
     for i in range(count):
         curr_p = verts[i]
         if i == 0:
             tangent = (verts[1] - curr_p).normalized()
         elif i == count - 1:
-            tangent = (curr_p - verts[i-1]).normalized()
+            tangent = (curr_p - verts[i - 1]).normalized()
         else:
-            t1 = (curr_p - verts[i-1]).normalized()
-            t2 = (verts[i+1] - curr_p).normalized()
+            t1 = (curr_p - verts[i - 1]).normalized()
+            t2 = (verts[i + 1] - curr_p).normalized()
             tangent = (t1 + t2).normalized()
-        
+            if tangent.length_squared == 0.0:
+                tangent = t2 if t2.length_squared > 0.0 else t1
+
         normal = Vector((-tangent.y, tangent.x))
         p0 = curr_p + normal * half_w
         p1 = curr_p - normal * half_w
-        
+
         pos_data.append((p0.x, p0.y))
         pos_data.append((p1.x, p1.y))
-        
-        if total_length > 0:
-            u = distances[i] / total_length
-        else:
-            u = 0.0
+
+        u = distances[i] / total_length if total_length > 0.0 else 0.0
         uv_data.append((u, 1.0))
         uv_data.append((u, -1.0))
     return pos_data, uv_data
@@ -1421,6 +1599,17 @@ def get_panel_settings():
                     (0.9, 0.6, 1.0, 1.0),
                     (0.7, 0.3, 0.9, 1.0)
                 ]
+
+            endpoint_gradient_colors = []
+            endpoint_color_count = getattr(settings, 'endpoint_gradient_color_count', color_count)
+            endpoint_colors = getattr(settings, 'endpoint_gradient_colors', None)
+
+            if endpoint_colors and len(endpoint_colors) > 0:
+                for i in range(min(endpoint_color_count, len(endpoint_colors))):
+                    endpoint_gradient_colors.append(to_rgba(endpoint_colors[i]))
+
+            if len(endpoint_gradient_colors) < 2:
+                endpoint_gradient_colors = list(gradient_colors)
             
             # 读取底层背景颜色（新格式：RGB和Alpha分开，兼容旧格式）
             backing_color_rgba = (0.0, 0.0, 0.0, 0.55)  # 默认值
@@ -1455,6 +1644,8 @@ def get_panel_settings():
                 'animation_speed': settings.animation_speed,
                 'line_thickness': settings.line_thickness,
                 'node_border_thickness': settings.node_border_thickness,
+                'endpoint_overlay_size': getattr(settings, 'endpoint_overlay_size', 0.92),
+                'endpoint_overlay_thickness': getattr(settings, 'endpoint_overlay_thickness', 0.78),
                 'enable_colorful_connections': settings.enable_colorful_connections,
                 'connection_color_type': settings.connection_color_type,
                 'trace_mode': getattr(settings, 'trace_mode', 'ALL_SELECTED'),
@@ -1464,7 +1655,8 @@ def get_panel_settings():
                 'overall_opacity': getattr(settings, 'overall_opacity', 1.0),
                 'backing_color': backing_color_rgba,
                 'gradient_colors': gradient_colors,
-                'field_gradient_colors': field_gradient_colors
+                'field_gradient_colors': field_gradient_colors,
+                'endpoint_gradient_colors': endpoint_gradient_colors
             }
         else:
             # 默认值
@@ -1472,6 +1664,8 @@ def get_panel_settings():
                 'animation_speed': 1.0,
                 'line_thickness': 2.0,
                 'node_border_thickness': 3.0,
+                'endpoint_overlay_size': 0.92,
+                'endpoint_overlay_thickness': 0.78,
                 'enable_colorful_connections': True,
                 'connection_color_type': 'CUSTOM',
                 'trace_mode': 'ALL_SELECTED',
@@ -1493,6 +1687,13 @@ def get_panel_settings():
                     (1.0, 0.4, 0.8, 1.0),
                     (0.9, 0.6, 1.0, 1.0),
                     (0.7, 0.3, 0.9, 1.0)
+                ],
+                'endpoint_gradient_colors': [
+                    (0.0, 0.5, 1.0, 1.0),
+                    (0.0, 1.0, 0.8, 1.0),
+                    (1.0, 1.0, 0.0, 1.0),
+                    (1.0, 0.5, 0.0, 1.0),
+                    (1.0, 0.0, 0.5, 1.0)
                 ]
             }
     except Exception as e:
@@ -1502,13 +1703,31 @@ def get_panel_settings():
             'animation_speed': 1.0,
             'line_thickness': 2.0,
             'node_border_thickness': 3.0,
+            'endpoint_overlay_size': 0.92,
+            'endpoint_overlay_thickness': 0.78,
             'enable_colorful_connections': True,
             'connection_color_type': 'CUSTOM',
             'trace_mode': 'ALL_SELECTED',
             'flow_direction': 'DOWNSTREAM',
             'lock_flow': False,
             'enable_type_based_colors': False,
+            'overall_opacity': 1.0,
+            'backing_color': (0.0, 0.0, 0.0, 0.55),
             'gradient_colors': [
+                (0.0, 0.5, 1.0, 1.0),
+                (0.0, 1.0, 0.8, 1.0),
+                (1.0, 1.0, 0.0, 1.0),
+                (1.0, 0.5, 0.0, 1.0),
+                (1.0, 0.0, 0.5, 1.0)
+            ],
+            'field_gradient_colors': [
+                (0.8, 0.2, 1.0, 1.0),
+                (0.6, 0.4, 1.0, 1.0),
+                (1.0, 0.4, 0.8, 1.0),
+                (0.9, 0.6, 1.0, 1.0),
+                (0.7, 0.3, 0.9, 1.0)
+            ],
+            'endpoint_gradient_colors': [
                 (0.0, 0.5, 1.0, 1.0),
                 (0.0, 1.0, 0.8, 1.0),
                 (1.0, 1.0, 0.0, 1.0),
@@ -1604,7 +1823,7 @@ def draw_colorful_connections():
     tree = context.space_data.node_tree
     if not tree:
         return
-    
+
     settings = get_panel_settings()
     if not settings.get('enable_colorful_connections', True):
         return
@@ -1623,17 +1842,17 @@ def draw_colorful_connections():
         nodes_to_outline = set(selected_nodes)  # 边框只画选中的
         for node in selected_nodes:
             trace_all_reroute_links(node, links_to_draw)
-            
+
     elif trace_mode == 'ACTIVE_FLOW':
         # 新逻辑：仅追踪活动节点的数据流
         lock_flow = settings.get('lock_flow', False)
-        
+
         # 如果取消了锁定，清除保存的状态
         if not lock_flow and _locked_flow_data['is_locked']:
             _locked_flow_data['is_locked'] = False
             _locked_flow_data['links'].clear()
             _locked_flow_data['nodes'].clear()
-        
+
         # 检查是否需要使用固定的流
         if lock_flow and _locked_flow_data['is_locked']:
             # 使用固定的流数据
@@ -1644,17 +1863,17 @@ def draw_colorful_connections():
             active_node = context.active_node
             if not active_node:
                 return
-            
+
             # 边框始终画活动节点
             nodes_to_outline.add(active_node)
-            
+
             direction = settings.get('flow_direction', 'DOWNSTREAM')
-            
+
             if direction == 'BOTH':
                 # 双向模式：使用两个独立的 visited_nodes 集合，避免相互干扰
                 visited_nodes_forward = set()
                 visited_nodes_backward = set()
-                
+
                 # 向下遍历
                 traverse_recursive(active_node, 'forward', links_to_draw, visited_nodes_forward)
                 # 向上遍历
@@ -1666,7 +1885,7 @@ def draw_colorful_connections():
                     traverse_recursive(active_node, 'forward', links_to_draw, visited_nodes_trace)
                 elif direction == 'UPSTREAM':
                     traverse_recursive(active_node, 'backward', links_to_draw, visited_nodes_trace)
-            
+
             # 如果启用了锁定，保存当前的流状态
             if lock_flow:
                 _locked_flow_data['links'] = links_to_draw.copy()
@@ -1685,9 +1904,12 @@ def draw_colorful_connections():
     time_sec = time.time() * settings.get('animation_speed', 1.0)
     connection_color_type = settings.get('connection_color_type', 'CUSTOM')
     overall_opacity = settings.get('overall_opacity', 1.0)
+    endpoint_overlay_size = settings.get('endpoint_overlay_size', 0.92)
+    endpoint_overlay_thickness = settings.get('endpoint_overlay_thickness', 0.78)
 
     grad_cols = settings.get('gradient_colors', [])
     field_grad_cols = settings.get('field_gradient_colors', [])
+    endpoint_grad_cols = settings.get('endpoint_gradient_colors', [])
 
     socket_index_cache = {}
     curv_factor = get_curving_factor()
@@ -1695,10 +1917,13 @@ def draw_colorful_connections():
     width_backing = max(2.0, 9.0 * zoom)
     width_main = max(1.5, settings.get('line_thickness', 2.0) * zoom)
     batch_node_bbox = []
+    endpoint_overlays = []
+    endpoint_overlay_seen = set()
 
 
 
     # 处理节点边框
+    bbox_width = max(border_pixel_size, settings.get('node_border_thickness', 3.0) * border_pixel_size * zoom)
     if nodes_to_outline:
         border_thickness = settings.get('node_border_thickness', 3.0)
         bbox_width = max(border_pixel_size, border_thickness * border_pixel_size * zoom)
@@ -1744,9 +1969,11 @@ def draw_colorful_connections():
         if not pts or len(pts) < 2:
             continue
 
+        from_center = v2d.view_to_region(l1x, l1y, clip=False)
+        to_center = v2d.view_to_region(l2x, l2y, clip=False)
         link_socket_masks = []
-        _append_socket_mask(link_socket_masks, set(), fs, v2d.view_to_region(l1x, l1y, clip=False), zoom, clip_width=width_main, extra_padding=0.2)
-        _append_socket_mask(link_socket_masks, set(), ts, v2d.view_to_region(l2x, l2y, clip=False), zoom, clip_width=width_main, extra_padding=0.2)
+        _append_socket_mask(link_socket_masks, set(), fs, from_center, zoom, clip_width=width_main, extra_padding=0.2)
+        _append_socket_mask(link_socket_masks, set(), ts, to_center, zoom, clip_width=width_main, extra_padding=0.2)
         line_segments = split_polyline_by_socket_masks(pts, link_socket_masks)
         if not line_segments:
             continue
@@ -1762,23 +1989,61 @@ def draw_colorful_connections():
 
         # 保存连线信息和socket信息
         is_field = is_field_link(tree, link)
+        link_colors = field_grad_cols if is_field else grad_cols
+        if enable_type_colors:
+            link_colors = apply_type_based_color_shift(link_colors, fs, ts, offset_strength=0.5)
+
+        append_socket_overlay(
+            endpoint_overlays,
+            endpoint_overlay_seen,
+            fs,
+            from_center,
+            zoom,
+            max(width_main, bbox_width),
+            colors=endpoint_grad_cols,
+            overlay_size=endpoint_overlay_size,
+        )
+        append_socket_overlay(
+            endpoint_overlays,
+            endpoint_overlay_seen,
+            ts,
+            to_center,
+            zoom,
+            max(width_main, bbox_width),
+            colors=endpoint_grad_cols,
+            overlay_size=endpoint_overlay_size,
+        )
+
         link_info_list.append({
             'pts': line_segments,
             'from_socket': fs,
             'to_socket': ts,
             'is_field': is_field,
+            'colors': link_colors,
         })
+
+    for node in nodes_to_outline:
+        collect_node_socket_overlays(
+            node,
+            v2d,
+            zoom,
+            max(width_main, bbox_width),
+            endpoint_overlays,
+            endpoint_overlay_seen,
+            colors=endpoint_grad_cols,
+            overlay_size=endpoint_overlay_size,
+        )
 
     # 分离Field和Constant连线
     field_links = []
     constant_links = []
-    
+
     for link_info in link_info_list:
         if link_info.get('is_field', False):
             field_links.append(link_info)
         else:
             constant_links.append(link_info)
-    
+
     # 1. Backing (底层背景) - 给所有连线画背景
     all_backing = [segment for info in link_info_list for segment in info['pts']]
     if all_backing:
@@ -1818,11 +2083,14 @@ def draw_colorful_connections():
                     continue
                 # 获取该类型的颜色偏移
                 sample_link = type_links[0]
-                ts = sample_link['to_socket']
-                link_colors = apply_type_based_color_shift(grad_cols, sample_link['from_socket'], ts, offset_strength=0.5)
-                # 批量绘制所有相同类型的连线
-                type_points = [segment for info in type_links for segment in info['pts']]
-                draw_batch_lines(type_points, 'GRADIENT', width_main, colors=link_colors, time_sec=time_sec, overall_opacity=overall_opacity)
+                draw_batch_lines(
+                    [segment for info in type_links for segment in info['pts']],
+                    'GRADIENT',
+                    width_main,
+                    colors=sample_link['colors'],
+                    time_sec=time_sec,
+                    overall_opacity=overall_opacity,
+                )
         else:
             # 所有连线使用相同颜色
             constant_main = [segment for info in constant_links for segment in info['pts']]
@@ -1846,11 +2114,14 @@ def draw_colorful_connections():
                     continue
                 # 获取该类型的颜色偏移
                 sample_link = type_links[0]
-                ts = sample_link['to_socket']
-                link_colors = apply_type_based_color_shift(field_grad_cols, sample_link['from_socket'], ts, offset_strength=0.5)
-                # 批量绘制所有相同类型的连线
-                type_points = [segment for info in type_links for segment in info['pts']]
-                draw_batch_lines(type_points, 'GRADIENT', width_main, colors=link_colors, time_sec=time_sec, overall_opacity=overall_opacity)
+                draw_batch_lines(
+                    [segment for info in type_links for segment in info['pts']],
+                    'GRADIENT',
+                    width_main,
+                    colors=sample_link['colors'],
+                    time_sec=time_sec,
+                    overall_opacity=overall_opacity,
+                )
         else:
             # 所有Field连线使用Field配色方案
             field_main = [segment for info in field_links for segment in info['pts']]
@@ -1859,6 +2130,25 @@ def draw_colorful_connections():
     # 3. Node Borders
     if batch_node_bbox:
         draw_batch_lines(batch_node_bbox, 'GRADIENT', bbox_width, colors=grad_cols, time_sec=time_sec, overall_opacity=overall_opacity)
+
+    # 4. Endpoint Overlays
+    if endpoint_overlays:
+        overlays_by_color = {}
+        for overlay in endpoint_overlays:
+            overlay_colors = overlay['colors'] or endpoint_grad_cols or grad_cols
+            colors_key = tuple(tuple(round(v, 6) for v in color) for color in overlay_colors)
+            overlays_by_color.setdefault(colors_key, {'paths': [], 'colors': overlay_colors})
+            overlays_by_color[colors_key]['paths'].append(overlay['path'])
+
+        for overlay_group in overlays_by_color.values():
+            draw_batch_lines(
+                overlay_group['paths'],
+                'GRADIENT',
+                max(width_main, bbox_width) * endpoint_overlay_thickness,
+                colors=overlay_group['colors'],
+                time_sec=time_sec,
+                overall_opacity=overall_opacity,
+            )
 
     gpu.state.blend_set('NONE')
     # 性能优化：根据连线数量动态调整重绘频率
@@ -1870,7 +2160,7 @@ def draw_colorful_connections():
         redraw_interval = 0.15  # 中等数量连线
     else:
         redraw_interval = 0.1  # 少量连线，正常刷新频率
-    
+
     if not bpy.app.timers.is_registered(force_redraw):
         bpy.app.timers.register(force_redraw, first_interval=redraw_interval)
 

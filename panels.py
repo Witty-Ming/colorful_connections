@@ -133,7 +133,7 @@ def _save_global_settings_internal(settings):
             'trace_mode': settings.trace_mode,
             'flow_direction': settings.flow_direction,
             'lock_flow': settings.lock_flow,
-            
+
             # 颜色设置
             'enable_type_based_colors': settings.enable_type_based_colors,
             'connection_color_type': settings.connection_color_type,
@@ -141,16 +141,20 @@ def _save_global_settings_internal(settings):
             'gradient_colors': [],
             'field_gradient_color_count': getattr(settings, 'field_gradient_color_count', 5),
             'field_gradient_colors': [],
-            
+            'endpoint_gradient_color_count': getattr(settings, 'endpoint_gradient_color_count', 5),
+            'endpoint_gradient_colors': [],
+
             # 外观设置
             'animation_speed': settings.animation_speed,
             'line_thickness': settings.line_thickness,
             'node_border_thickness': settings.node_border_thickness,
+            'endpoint_overlay_size': getattr(settings, 'endpoint_overlay_size', 1.0),
+            'endpoint_overlay_thickness': getattr(settings, 'endpoint_overlay_thickness', 0.78),
             'enable_colorful_connections': settings.enable_colorful_connections,
             'overall_opacity': getattr(settings, 'overall_opacity', 1.0),
             'backing_color_rgb': list(getattr(settings, 'backing_color_rgb', (0.0, 0.0, 0.0))),
             'backing_color_alpha': getattr(settings, 'backing_color_alpha', 0.55),
-            
+
             # 预设相关
             'active_preset_index': settings.active_preset_index,
             'last_applied_preset_index': getattr(settings, 'last_applied_preset_index', -1),
@@ -166,6 +170,13 @@ def _save_global_settings_internal(settings):
         # 保存Field颜色配置
         for color_item in getattr(settings, 'field_gradient_colors', []):
             settings_data['field_gradient_colors'].append({
+                'color': list(color_item.color[:3]),
+                'alpha': getattr(color_item, 'alpha', 1.0)
+            })
+
+        # 保存端点空心罩颜色配置
+        for color_item in getattr(settings, 'endpoint_gradient_colors', []):
+            settings_data['endpoint_gradient_colors'].append({
                 'color': list(color_item.color[:3]),
                 'alpha': getattr(color_item, 'alpha', 1.0)
             })
@@ -264,6 +275,25 @@ def load_global_settings(settings):
                         settings.field_gradient_color_count = settings_data['field_gradient_color_count']
                 except:
                     pass
+
+        # 加载端点空心罩颜色列表
+        if 'endpoint_gradient_color_count' in settings_data:
+            settings.endpoint_gradient_color_count = settings_data['endpoint_gradient_color_count']
+        if 'endpoint_gradient_colors' in settings_data:
+            try:
+                settings.endpoint_gradient_colors.clear()
+                for color_data in settings_data['endpoint_gradient_colors']:
+                    color_item = settings.endpoint_gradient_colors.add()
+                    color_rgb = color_data.get('color', [0.0, 0.5, 1.0])
+                    color_item.color = (color_rgb[0], color_rgb[1], color_rgb[2])
+                    color_item.alpha = color_data.get('alpha', 1.0)
+            except Exception as e:
+                print(f"加载端点空心罩颜色列表失败: {e}")
+                try:
+                    if 'endpoint_gradient_color_count' in settings_data:
+                        settings.endpoint_gradient_color_count = settings_data['endpoint_gradient_color_count']
+                except:
+                    pass
         
         # 加载外观设置
         if 'animation_speed' in settings_data:
@@ -272,6 +302,10 @@ def load_global_settings(settings):
             settings.line_thickness = settings_data['line_thickness']
         if 'node_border_thickness' in settings_data:
             settings.node_border_thickness = settings_data['node_border_thickness']
+        if 'endpoint_overlay_size' in settings_data:
+            settings.endpoint_overlay_size = settings_data['endpoint_overlay_size']
+        if 'endpoint_overlay_thickness' in settings_data:
+            settings.endpoint_overlay_thickness = settings_data['endpoint_overlay_thickness']
         if 'enable_colorful_connections' in settings_data:
             settings.enable_colorful_connections = settings_data['enable_colorful_connections']
         if 'overall_opacity' in settings_data:
@@ -516,6 +550,17 @@ class ColorfulConnectionsSettings(bpy.types.PropertyGroup):
         max=10,
         update=lambda self, context: self._update_field_color_count_and_save(context)
     )
+
+    # --- 动态颜色系统：端点空心罩 ---
+    endpoint_gradient_colors: bpy.props.CollectionProperty(type=GradientColorItem)
+    endpoint_gradient_color_count: bpy.props.IntProperty(
+        name="端点颜色数量",
+        description="端点空心罩渐变中使用的颜色数量",
+        default=5,
+        min=2,
+        max=10,
+        update=lambda self, context: self._update_endpoint_color_count_and_save(context)
+    )
     
     def _update_color_count_and_save(self, context):
         """更新常量颜色数量并保存"""
@@ -561,18 +606,18 @@ class ColorfulConnectionsSettings(bpy.types.PropertyGroup):
         self._update_field_color_count()
         _force_redraw_update()
         _autosave_settings(context)
-    
+
     def _update_field_color_count(self):
         """更新域颜色数量时，确保集合中有足够的颜色项"""
         # 关键修复：添加 try-except 块以防止在文件加载期间修改 ID 数据
         try:
             target_count = self.field_gradient_color_count
             current_count = len(self.field_gradient_colors)
-            
+
             # 如果数量减少，只保留前N个
             while len(self.field_gradient_colors) > target_count:
                 self.field_gradient_colors.remove(len(self.field_gradient_colors) - 1)
-            
+
             # 如果数量增加，添加默认颜色（紫色系，用于区分Field）
             while len(self.field_gradient_colors) < target_count:
                 item = self.field_gradient_colors.add()
@@ -592,6 +637,38 @@ class ColorfulConnectionsSettings(bpy.types.PropertyGroup):
                 item.alpha = 1.0  # 默认完全不透明
         except AttributeError:
             # 如果在文件加载期间触发，Blender禁止修改ID类，直接忽略
+            pass
+
+    def _update_endpoint_color_count_and_save(self, context):
+        """更新端点空心罩颜色数量并保存"""
+        self._update_endpoint_color_count()
+        _force_redraw_update()
+        _autosave_settings(context)
+
+    def _update_endpoint_color_count(self):
+        """更新端点空心罩颜色数量时，确保集合中有足够的颜色项"""
+        try:
+            target_count = self.endpoint_gradient_color_count
+
+            while len(self.endpoint_gradient_colors) > target_count:
+                self.endpoint_gradient_colors.remove(len(self.endpoint_gradient_colors) - 1)
+
+            while len(self.endpoint_gradient_colors) < target_count:
+                item = self.endpoint_gradient_colors.add()
+                idx = len(self.endpoint_gradient_colors) - 1
+                defaults = [
+                    (0.0, 0.5, 1.0),
+                    (0.0, 1.0, 0.8),
+                    (1.0, 1.0, 0.0),
+                    (1.0, 0.5, 0.0),
+                    (1.0, 0.0, 0.5),
+                ]
+                if idx < len(defaults):
+                    item.color = defaults[idx]
+                else:
+                    item.color = (1.0, 1.0, 1.0)
+                item.alpha = 1.0
+        except AttributeError:
             pass
     
     # --- 预设系统 ---
@@ -619,13 +696,31 @@ class ColorfulConnectionsSettings(bpy.types.PropertyGroup):
 
     node_border_thickness: bpy.props.FloatProperty(
         name="节点边框粗细",
-        description="设置节点彩色边框的粗细程度",
+        description="设置节点边框的粗细程度",
         default=3.0,
         min=1.0,
         max=20.0,
         update=_save_and_redraw_update
     )
-    
+
+    endpoint_overlay_size: bpy.props.FloatProperty(
+        name="端点尺寸",
+        description="调整端点空心罩的整体尺寸",
+        default=1.0,
+        min=0.1,
+        max=1.4,
+        update=_save_and_redraw_update
+    )
+
+    endpoint_overlay_thickness: bpy.props.FloatProperty(
+        name="端点粗细",
+        description="调整端点空心罩的描边粗细",
+        default=0.78,
+        min=0.35,
+        max=1.4,
+        update=_save_and_redraw_update
+    )
+
     enable_colorful_connections: bpy.props.BoolProperty(
         name="启用彩色连线",
         description="启用或禁用彩色连线功能",
@@ -792,12 +887,17 @@ class NODE_PT_colorful_connections_panel(bpy.types.Panel):
         settings = scene.colorful_connections_settings
 
         col = layout.column()
-        
+
         # 启用/禁用开关
         col.prop(settings, "enable_colorful_connections")
-        
+
+        box_general = col.box()
+        box_general.label(text="基础设置:", icon='PREFERENCES')
+        box_general.prop(settings, "connection_color_type", text="颜色类型")
+        box_general.prop(settings, "overall_opacity")
+
         col.separator()
-        
+
         # --- 预设管理区域（移到顶层） ---
         box_preset = col.box()
         box_preset.label(text="预设方案:", icon='PRESET')
@@ -898,14 +998,14 @@ class NODE_PT_colorful_connections_panel(bpy.types.Panel):
         # Field（域）类型配色
         box_field = col.box()
         box_field.label(text="域类型 (Field):", icon='PHYSICS')
-        
+
         # 颜色数量控制
         row = box_field.row()
         row.label(text="颜色数量:")
         row.prop(settings, "field_gradient_color_count", text="")
-        
+
         box_field.separator()
-        
+
         # 紧凑的颜色列表
         box_field.label(text="颜色列表 (循环渐变):")
         field_active_count = settings.field_gradient_color_count
@@ -925,18 +1025,46 @@ class NODE_PT_colorful_connections_panel(bpy.types.Panel):
             item_col = box_field.column(align=True)
             item_col.prop(field_colors[idx], "color", text=f"颜色 {idx+1}")
             item_col.prop(field_colors[idx], "alpha", text="透明度", slider=True)
-        
+
         # 如果颜色不足，显示提示（但不在这里修改场景数据）
         if len(field_colors) < field_active_count:
             box_field.label(text=f"颜色数量不足，请重新加载插件", icon='ERROR')
+
+        col.separator()
+
+        # Endpoint（端点空心罩）配色
+        box_endpoint = col.box()
+        box_endpoint.label(text="端点空心罩:", icon='MESH_CIRCLE')
+
+        row = box_endpoint.row()
+        row.label(text="颜色数量:")
+        row.prop(settings, "endpoint_gradient_color_count", text="")
+        box_endpoint.prop(settings, "endpoint_overlay_size")
+        box_endpoint.prop(settings, "endpoint_overlay_thickness")
+
+        box_endpoint.separator()
+        box_endpoint.label(text="颜色列表 (循环渐变):")
+        endpoint_active_count = settings.endpoint_gradient_color_count
+        endpoint_colors = settings.endpoint_gradient_colors
+
+        endpoint_display_count = min(endpoint_active_count, len(endpoint_colors))
+        for idx in range(endpoint_display_count):
+            if not hasattr(endpoint_colors[idx], 'alpha'):
+                endpoint_colors[idx].alpha = 1.0
+
+            item_col = box_endpoint.column(align=True)
+            item_col.prop(endpoint_colors[idx], "color", text=f"颜色 {idx+1}")
+            item_col.prop(endpoint_colors[idx], "alpha", text="透明度", slider=True)
+
+        if len(endpoint_colors) < endpoint_active_count:
+            box_endpoint.label(text=f"颜色数量不足，请重新加载插件", icon='ERROR')
         
         col.separator()
         col.label(text="外观设置:")
         col.prop(settings, "line_thickness")
         col.prop(settings, "node_border_thickness")
         col.prop(settings, "animation_speed")
-        col.prop(settings, "overall_opacity")
-        
+
         col.separator()
         col.label(text="底层背景:")
         backing_col = col.column(align=True)
@@ -1041,6 +1169,13 @@ def on_load_post(dummy):
                     settings._update_field_color_count()
             except (AttributeError, RuntimeError, ReferenceError) as e:
                 print(f"设置field_gradient_color_count失败: {e}")
+
+            try:
+                if len(settings.endpoint_gradient_colors) == 0:
+                    settings.endpoint_gradient_color_count = 5
+                    settings._update_endpoint_color_count()
+            except (AttributeError, RuntimeError, ReferenceError) as e:
+                print(f"设置endpoint_gradient_color_count失败: {e}")
             
             # 如果有预设，尝试应用（使用安全的方式）
             try:
@@ -1132,6 +1267,14 @@ def register():
                     settings._update_field_color_count() # 确保触发
             except (AttributeError, RuntimeError, ReferenceError) as e:
                 print(f"设置field_gradient_color_count失败: {e}")
+
+            # 如果端点空心罩颜色为空，设置默认值
+            try:
+                if len(settings.endpoint_gradient_colors) == 0:
+                    settings.endpoint_gradient_color_count = 5  # 这会触发 _update_endpoint_color_count
+                    settings._update_endpoint_color_count() # 确保触发
+            except (AttributeError, RuntimeError, ReferenceError) as e:
+                print(f"设置endpoint_gradient_color_count失败: {e}")
             
             # 预设加载优先级：最后应用的 > 最后保存的 > 第一个 > 默认值
             try:
